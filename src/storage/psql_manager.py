@@ -16,6 +16,10 @@ from log import log
 class PSQLManager:
     """PostgreSQL 数据库管理器"""
 
+    CREDENTIALS_TABLE = "gcli_credentials"
+    ANTIGRAVITY_CREDENTIALS_TABLE = "gcli_antigravity_credentials"
+    CONFIG_TABLE = "gcli_config"
+
     # 状态字段常量
     STATE_FIELDS = {
         "error_codes",
@@ -73,8 +77,8 @@ class PSQLManager:
 
     async def _create_tables(self, conn: asyncpg.Connection) -> None:
         """创建数据库表和索引"""
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS credentials (
+        await conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.CREDENTIALS_TABLE} (
                 id SERIAL PRIMARY KEY,
                 filename TEXT UNIQUE NOT NULL,
                 credential_data TEXT NOT NULL,
@@ -85,7 +89,7 @@ class PSQLManager:
                 last_success DOUBLE PRECISION,
                 user_email TEXT,
 
-                model_cooldowns TEXT DEFAULT '{}',
+                model_cooldowns TEXT DEFAULT '{{}}',
                 preview INTEGER DEFAULT 1,
                 tier TEXT DEFAULT 'pro',
 
@@ -97,8 +101,8 @@ class PSQLManager:
             )
         """)
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS antigravity_credentials (
+        await conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.ANTIGRAVITY_CREDENTIALS_TABLE} (
                 id SERIAL PRIMARY KEY,
                 filename TEXT UNIQUE NOT NULL,
                 credential_data TEXT NOT NULL,
@@ -109,7 +113,7 @@ class PSQLManager:
                 last_success DOUBLE PRECISION,
                 user_email TEXT,
 
-                model_cooldowns TEXT DEFAULT '{}',
+                model_cooldowns TEXT DEFAULT '{{}}',
                 tier TEXT DEFAULT 'pro',
                 enable_credit INTEGER DEFAULT 0,
 
@@ -121,8 +125,8 @@ class PSQLManager:
             )
         """)
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS config (
+        await conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.CONFIG_TABLE} (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())
@@ -130,17 +134,21 @@ class PSQLManager:
         """)
 
         # 索引
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_disabled ON credentials(disabled)
+        await conn.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_gcli_credentials_disabled
+            ON {self.CREDENTIALS_TABLE}(disabled)
         """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_rotation_order ON credentials(rotation_order)
+        await conn.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_gcli_credentials_rotation_order
+            ON {self.CREDENTIALS_TABLE}(rotation_order)
         """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ag_disabled ON antigravity_credentials(disabled)
+        await conn.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_gcli_ag_credentials_disabled
+            ON {self.ANTIGRAVITY_CREDENTIALS_TABLE}(disabled)
         """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ag_rotation_order ON antigravity_credentials(rotation_order)
+        await conn.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_gcli_ag_credentials_rotation_order
+            ON {self.ANTIGRAVITY_CREDENTIALS_TABLE}(rotation_order)
         """)
 
         log.debug("PostgreSQL tables and indexes created")
@@ -148,7 +156,7 @@ class PSQLManager:
     async def _ensure_schema_compatibility(self, conn: asyncpg.Connection) -> None:
         """确保数据库结构兼容，自动修复缺失的列"""
         required_columns = {
-            "credentials": [
+            self.CREDENTIALS_TABLE: [
                 ("disabled", "INTEGER DEFAULT 0"),
                 ("error_codes", "TEXT DEFAULT '[]'"),
                 ("error_messages", "TEXT DEFAULT '[]'"),
@@ -162,7 +170,7 @@ class PSQLManager:
                 ("created_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
                 ("updated_at", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())"),
             ],
-            "antigravity_credentials": [
+            self.ANTIGRAVITY_CREDENTIALS_TABLE: [
                 ("disabled", "INTEGER DEFAULT 0"),
                 ("error_codes", "TEXT DEFAULT '[]'"),
                 ("error_messages", "TEXT DEFAULT '[]'"),
@@ -205,7 +213,7 @@ class PSQLManager:
 
         try:
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch("SELECT key, value FROM config")
+                rows = await conn.fetch(f"SELECT key, value FROM {self.CONFIG_TABLE}")
 
             for row in rows:
                 try:
@@ -234,9 +242,9 @@ class PSQLManager:
 
     def _get_table_name(self, mode: str) -> str:
         if mode == "antigravity":
-            return "antigravity_credentials"
+            return self.ANTIGRAVITY_CREDENTIALS_TABLE
         elif mode == "geminicli":
-            return "credentials"
+            return self.CREDENTIALS_TABLE
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'geminicli' or 'antigravity'")
 
@@ -328,8 +336,8 @@ class PSQLManager:
 
         try:
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch("""
-                    SELECT filename FROM credentials
+                rows = await conn.fetch(f"""
+                    SELECT filename FROM {self.CREDENTIALS_TABLE}
                     WHERE disabled = 0
                     ORDER BY rotation_order ASC
                 """)
@@ -835,8 +843,8 @@ class PSQLManager:
 
         try:
             async with self._pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO config (key, value, updated_at)
+                await conn.execute(f"""
+                    INSERT INTO {self.CONFIG_TABLE} (key, value, updated_at)
                     VALUES ($1, $2, EXTRACT(EPOCH FROM NOW()))
                     ON CONFLICT (key) DO UPDATE
                         SET value = EXCLUDED.value,
@@ -873,7 +881,7 @@ class PSQLManager:
 
         try:
             async with self._pool.acquire() as conn:
-                await conn.execute("DELETE FROM config WHERE key = $1", key)
+                await conn.execute(f"DELETE FROM {self.CONFIG_TABLE} WHERE key = $1", key)
 
             self._config_cache.pop(key, None)
             return True
