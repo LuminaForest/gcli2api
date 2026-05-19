@@ -1,11 +1,29 @@
-version: '3.8'
-
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gcli2api-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-T9#vQ2mL8}
+      - POSTGRES_DB=${POSTGRES_DB:-gcli}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   gcli2api:
-    image: ghcr.io/su-kaka/gcli2api:latest
+    image: tummifix/gcli2api:latest
     container_name: gcli2api
     restart: unless-stopped
-    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PORT:-7861}:${PORT:-7861}"
     environment:
       # Password configuration (choose one)
       # Option 1: Use common password
@@ -32,8 +50,8 @@ services:
       # - MONGODB_URI=${MONGODB_URI}
       # - MONGODB_DATABASE=${MONGODB_DATABASE:-gcli2api}
 
-      # Optional: PostgreSQL configuration (for distributed storage)
-      # - POSTGRES_DSN=${POSTGRES_DSN}
+      # PostgreSQL configuration (for distributed storage)
+      - POSTGRESQL_URI=${POSTGRESQL_URI:-postgresql://postgres:T9%23vQ2mL8@postgres:5432/gcli}
 
       # Optional: Proxy configuration
       # - PROXY=${PROXY}
@@ -74,6 +92,7 @@ services:
 #      timeout: 5s
 #      retries: 3
 
-#volumes:
+volumes:
+  postgres_data:
 #  redis_data:
 #  mongodb_data:
