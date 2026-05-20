@@ -27,10 +27,10 @@ services:
     environment:
       # Password configuration (choose one)
       # Option 1: Use common password
-      - PASSWORD=${PASSWORD:-pwd}
+      # - PASSWORD=${PASSWORD:-pwd}
       # Option 2: Use separate passwords (uncomment if needed)
-      # - API_PASSWORD=${API_PASSWORD:-your_api_password}
-      # - PANEL_PASSWORD=${PANEL_PASSWORD:-your_panel_password}
+      - API_PASSWORD=${API_PASSWORD:-Q7mX9vLp2Kc8}
+      - PANEL_PASSWORD=${PANEL_PASSWORD:-tR4zN8yHq1Wd}
 
       # Server configuration
       - PORT=${PORT:-7861}
