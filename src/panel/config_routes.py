@@ -31,6 +31,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["code_assist_endpoint"] = await config.get_code_assist_endpoint()
         current_config["credentials_dir"] = await config.get_credentials_dir()
         current_config["proxy"] = await config.get_proxy_config() or ""
+        current_config["proxy_pool"] = await config.get_proxy_pool_config()
 
         # 代理端点配置
         current_config["oauth_proxy_url"] = await config.get_oauth_proxy_url()
@@ -82,6 +83,8 @@ async def get_config(token: str = Depends(verify_panel_token)):
             if key not in env_locked_keys:
                 current_config[key] = value
 
+        current_config["proxy_pool"] = await config.get_proxy_pool_config()
+
         return JSONResponse(content={"config": current_config, "env_locked": list(env_locked_keys)})
 
     except Exception as e:
@@ -95,6 +98,8 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
     try:
 
         new_config = request.config
+        if "proxyPool" in new_config and "proxy_pool" not in new_config:
+            new_config["proxy_pool"] = new_config.pop("proxyPool")
 
         log.debug(f"收到的配置数据: {list(new_config.keys())}")
         log.debug(f"收到的password值: {new_config.get('password', 'NOT_FOUND')}")
@@ -129,6 +134,12 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 raise HTTPException(
                     status_code=400, detail="抗截断最大重试次数必须是1-10之间的整数"
                 )
+
+        if "proxy_pool" in new_config:
+            try:
+                new_config["proxy_pool"] = config.normalize_proxy_pool(new_config["proxy_pool"])
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
         if "compatibility_mode_enabled" in new_config:
             if not isinstance(new_config["compatibility_mode_enabled"], bool):
@@ -185,11 +196,20 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
 
         # 直接使用存储适配器保存配置
         storage_adapter = await get_storage_adapter()
+        failed_keys = []
         for key, value in new_config.items():
             if key not in env_locked_keys:
-                await storage_adapter.set_config(key, value)
+                saved = await storage_adapter.set_config(key, value)
+                if not saved:
+                    failed_keys.append(key)
                 if key in ("password", "api_password", "panel_password"):
                     log.debug(f"设置{key}字段为: {value}")
+
+        if failed_keys:
+            raise HTTPException(
+                status_code=500,
+                detail=f"以下配置保存失败: {', '.join(failed_keys)}"
+            )
 
         # 重新加载配置缓存（关键！）
         await config.reload_config()

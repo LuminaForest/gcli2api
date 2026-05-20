@@ -6,7 +6,9 @@ Centralizes all configuration to avoid duplication across modules.
 - 修改配置时调用 reload_config() 重新从数据库加载
 """
 
+import json
 import os
+from urllib.parse import quote, urlsplit, urlunsplit
 from typing import Any, Optional
 
 # 全局配置缓存
@@ -17,6 +19,8 @@ _config_initialized = False
 
 # 需要自动封禁的错误码 (默认值，可通过环境变量或配置覆盖)
 AUTO_BAN_ERROR_CODES = [403]
+
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5"}
 
 # ====================== 环境变量映射表 ======================
 # 统一维护环境变量名和配置键名的映射关系
@@ -116,6 +120,115 @@ async def get_proxy_config():
     """Get proxy configuration."""
     proxy_url = await get_config_value("proxy", env_var="PROXY")
     return proxy_url if proxy_url else None
+
+
+def validate_proxy_url(proxy_url: str) -> str:
+    """Validate and normalize a proxy URL."""
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        raise ValueError("代理URL不能为空")
+    if not any(proxy_url.startswith(f"{scheme}://") for scheme in SUPPORTED_PROXY_SCHEMES):
+        raise ValueError("代理URL必须以 http://、https:// 或 socks5:// 开头")
+    return proxy_url
+
+
+def _split_proxy_scheme(proxy_url: str) -> tuple[str | None, str]:
+    for scheme in SUPPORTED_PROXY_SCHEMES:
+        prefix = f"{scheme}://"
+        if proxy_url.startswith(prefix):
+            return scheme, proxy_url[len(prefix):]
+    return None, proxy_url
+
+
+def format_proxy_for_httpx(proxy_url: str) -> str:
+    """
+    Convert supported custom proxy formats into httpx-compatible URLs.
+
+    Supported saved formats:
+    - scheme://host:port
+    - scheme://user:password@host:port
+    - scheme://host:port:user:password
+    """
+    proxy_url = str(proxy_url or "").strip()
+    scheme, rest = _split_proxy_scheme(proxy_url)
+    if not scheme or "@" in rest:
+        return proxy_url
+
+    parts = rest.split(":", 3)
+    if len(parts) == 4 and all(parts):
+        host, port, user, password = parts
+        return f"{scheme}://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}"
+
+    return proxy_url
+
+
+def normalize_proxy_pool(value: Any) -> list[dict[str, str]]:
+    """Normalize proxy pool config into a list of {name, url}."""
+    if value in (None, ""):
+        return []
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("代理池必须是JSON数组") from exc
+
+    if not isinstance(value, list):
+        raise ValueError("代理池必须是数组")
+
+    normalized = []
+    seen_names = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("代理池每一项必须包含 name 和 url")
+
+        name = str(item.get("name", "")).strip()
+        url = validate_proxy_url(str(item.get("url", "")).strip())
+
+        if not name:
+            raise ValueError("代理名称不能为空")
+        if name in seen_names:
+            raise ValueError(f"代理名称重复: {name}")
+
+        seen_names.add(name)
+        normalized.append({"name": name, "url": url})
+
+    return normalized
+
+
+def mask_proxy_url(proxy_url: str) -> str:
+    """Mask credentials in proxy URLs for UI/log display."""
+    if not proxy_url:
+        return ""
+
+    scheme, rest = _split_proxy_scheme(proxy_url)
+    if scheme and "@" not in rest:
+        parts = rest.split(":", 3)
+        if len(parts) == 4 and all(parts):
+            host, port, user, _password = parts
+            return f"{scheme}://{host}:{port}:{user}:***"
+
+    try:
+        parsed = urlsplit(proxy_url)
+        if "@" not in parsed.netloc:
+            return proxy_url
+
+        userinfo, host = parsed.netloc.rsplit("@", 1)
+        user = userinfo.split(":", 1)[0]
+        auth = f"{user}:***"
+
+        return urlunsplit((parsed.scheme, f"{auth}@{host}", parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return proxy_url
+
+
+async def get_proxy_pool_config() -> list[dict[str, str]]:
+    """Get configured credential proxy pool."""
+    value = await get_config_value("proxy_pool", [])
+    try:
+        return normalize_proxy_pool(value)
+    except ValueError:
+        return []
 
 
 async def get_auto_ban_enabled() -> bool:

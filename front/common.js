@@ -26,6 +26,7 @@ const AppState = {
     // 配置管理
     currentConfig: {},
     envLockedFields: new Set(),
+    proxyPoolLoaded: false,
 
     // 日志管理
     logWebSocket: null,
@@ -74,7 +75,8 @@ function createCredsManager(type) {
                 refreshAllEmails: `./creds/refresh-all-emails`,
                 deduplicate: `./creds/deduplicate-by-email`,
                 verifyProject: `./creds/verify-project`,
-                quota: `./creds/quota`
+                quota: `./creds/quota`,
+                proxyBind: `./creds/proxy-bind`
             };
             return endpoints[action] || '';
         },
@@ -100,6 +102,7 @@ function createCredsManager(type) {
             try {
                 loading.style.display = 'block';
                 list.innerHTML = '';
+                await ensureProxyPoolLoaded();
 
                 const offset = (this.currentPage - 1) * this.pageSize;
                 const errorCodeFilter = this.currentErrorCodeFilter || 'all';
@@ -127,7 +130,8 @@ function createCredsManager(type) {
                             model_cooldowns: item.model_cooldowns || {},
                             preview: item.preview,
                             tier: item.tier || 'pro',
-                            enable_credit: !!item.enable_credit
+                            enable_credit: !!item.enable_credit,
+                            proxy_name: item.proxy_name || ''
                         };
                     });
 
@@ -255,7 +259,7 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtnNames = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview'];
+            const batchBtnNames = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'BindProxy'];
             if (this.type === 'antigravity') {
                 batchBtnNames.push('EnableCredit');
                 batchBtnNames.push('DisableCredit');
@@ -306,6 +310,66 @@ function createCredsManager(type) {
                 }
             } catch (error) {
                 showStatus(`网络错误: ${error.message}`, 'error');
+            }
+        },
+
+        async bindProxy(filename, proxyName) {
+            try {
+                const response = await fetch(`${this.getEndpoint('proxyBind')}?${this.getModeParam()}`, {
+                    method: 'POST',
+                    headers: getAuthHeaders(),
+                    body: JSON.stringify({ filename, proxy_name: proxyName || null })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    showStatus(data.message || '代理绑定已更新', 'success');
+                    await this.refresh();
+                } else {
+                    showStatus(`代理绑定失败: ${data.detail || data.error || '未知错误'}`, 'error');
+                    this.renderList();
+                }
+            } catch (error) {
+                showStatus(`代理绑定网络错误: ${error.message}`, 'error');
+                this.renderList();
+            }
+        },
+
+        async batchBindProxy(proxyName) {
+            const selectedFiles = Array.from(this.selectedFiles);
+            if (selectedFiles.length === 0) {
+                showStatus('请先选择要绑定代理的文件', 'error');
+                return;
+            }
+
+            const label = proxyName || '继承全局代理';
+            if (!confirm(`确定要为选中的 ${selectedFiles.length} 个文件设置代理为「${label}」吗？`)) return;
+
+            try {
+                const response = await fetch(`${this.getEndpoint('batchAction')}?${this.getModeParam()}`, {
+                    method: 'POST',
+                    headers: getAuthHeaders(),
+                    body: JSON.stringify({
+                        action: 'bind_proxy',
+                        filenames: selectedFiles,
+                        proxy_name: proxyName || null
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    const successCount = data.success_count || data.succeeded || 0;
+                    showStatus(`批量代理绑定完成：成功处理 ${successCount}/${selectedFiles.length} 个文件`, 'success');
+                    this.selectedFiles.clear();
+                    this.updateBatchControls();
+                    await this.refresh();
+                } else {
+                    showStatus(`批量代理绑定失败: ${data.detail || data.error || '未知错误'}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`批量代理绑定网络错误: ${error.message}`, 'error');
             }
         },
 
@@ -611,6 +675,64 @@ function getAuthHeaders() {
     };
 }
 
+function getProxyPool() {
+    return Array.isArray(AppState.currentConfig.proxy_pool) ? AppState.currentConfig.proxy_pool : [];
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function maskProxyUrl(proxyUrl) {
+    if (!proxyUrl) return '';
+    try {
+        const url = new URL(proxyUrl);
+        if (url.username) {
+            url.password = url.password ? '***' : '';
+            return url.toString();
+        }
+    } catch {
+        return proxyUrl;
+    }
+    return proxyUrl;
+}
+
+async function ensureProxyPoolLoaded() {
+    if (AppState.proxyPoolLoaded) return;
+
+    const response = await fetch('./config/get', { headers: getAuthHeaders() });
+    const data = await response.json();
+    if (response.ok) {
+        AppState.currentConfig = data.config || {};
+        AppState.envLockedFields = new Set(data.env_locked || []);
+        AppState.proxyPoolLoaded = true;
+        populateProxyBindSelects();
+    }
+}
+
+function populateProxyBindSelects() {
+    const pool = getProxyPool();
+    const selects = [
+        document.getElementById('batchProxySelect'),
+        document.getElementById('antigravityBatchProxySelect')
+    ].filter(Boolean);
+
+    selects.forEach(select => {
+        const currentValue = select.value;
+        select.innerHTML = '<option value="">继承全局代理</option>' + pool.map(proxy => {
+            const name = escapeHtml(proxy.name);
+            const title = escapeHtml(maskProxyUrl(proxy.url));
+            return `<option value="${name}" title="${title}">${name}</option>`;
+        }).join('');
+        select.value = pool.some(proxy => proxy.name === currentValue) ? currentValue : '';
+    });
+}
+
 function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
@@ -678,6 +800,19 @@ function createCredCard(credInfo, manager) {
         }
     }
 
+    const proxyPool = getProxyPool();
+    const boundProxyName = credInfo.proxy_name || '';
+    if (boundProxyName) {
+        const proxyEntry = proxyPool.find(proxy => proxy.name === boundProxyName);
+        if (proxyEntry) {
+            statusBadges += `<span class="status-badge" style="background-color: #455a64; color: white;" title="绑定代理: ${escapeHtml(maskProxyUrl(proxyEntry.url))}">Proxy: ${escapeHtml(boundProxyName)}</span>`;
+        } else {
+            statusBadges += `<span class="status-badge" style="background-color: #c62828; color: white;" title="代理池中找不到该代理，请重新绑定">Proxy丢失: ${escapeHtml(boundProxyName)}</span>`;
+        }
+    } else {
+        statusBadges += '<span class="status-badge" style="background-color: #78909c; color: white;" title="未绑定专属代理，请求时继承全局代理配置">Proxy: 全局</span>';
+    }
+
     // 模型级冷却状态
     if (credInfo.model_cooldowns && Object.keys(credInfo.model_cooldowns).length > 0) {
         const currentTime = Date.now() / 1000;
@@ -710,7 +845,25 @@ function createCredCard(credInfo, manager) {
     const pathId = (managerType === 'antigravity' ? 'ag_' : '') + btoa(encodeURIComponent(filename)).replace(/[+/=]/g, '_');
 
     // 操作按钮
+    const missingProxyOption = boundProxyName && !proxyPool.some(proxy => proxy.name === boundProxyName)
+        ? `<option value="${escapeHtml(boundProxyName)}" selected>${escapeHtml(boundProxyName)}（不存在）</option>`
+        : '';
+    const proxyOptions = '<option value="">继承全局代理</option>' + missingProxyOption + proxyPool.map(proxy => {
+        const selected = proxy.name === boundProxyName ? ' selected' : '';
+        const name = escapeHtml(proxy.name);
+        const title = escapeHtml(maskProxyUrl(proxy.url));
+        return `<option value="${name}" title="${title}"${selected}>${name}</option>`;
+    }).join('');
+    const proxySelector = `
+        <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #555;">
+            代理
+            <select class="cred-proxy-select" data-proxy-bind data-filename="${filename}" style="height: 30px; border: 1px solid #ddd; border-radius: 4px; padding: 0 6px;">
+                ${proxyOptions}
+            </select>
+        </label>
+    `;
     const actionButtons = `
+        ${proxySelector}
         ${status.disabled
             ? `<button class="cred-btn enable" data-filename="${filename}" data-action="enable">启用</button>`
             : `<button class="cred-btn disable" data-filename="${filename}" data-action="disable">禁用</button>`
@@ -776,6 +929,12 @@ function createCredCard(credInfo, manager) {
             } else {
                 manager.action(fn, action);
             }
+        });
+    });
+
+    div.querySelectorAll('[data-proxy-bind]').forEach(select => {
+        select.addEventListener('change', function () {
+            manager.bindProxy(this.getAttribute('data-filename'), this.value);
         });
     });
 
@@ -1420,6 +1579,9 @@ function toggleSelectAll() {
     AppState.creds.updateBatchControls();
 }
 function batchAction(action) { AppState.creds.batchAction(action); }
+function batchBindProxy() {
+    AppState.creds.batchBindProxy(document.getElementById('batchProxySelect')?.value || '');
+}
 function downloadCred(filename) {
     fetch(`./creds/download/${filename}`, { headers: { 'Authorization': `Bearer ${AppState.authToken}` } })
         .then(r => r.ok ? r.blob() : Promise.reject())
@@ -1480,6 +1642,9 @@ function toggleSelectAllAntigravity() {
     AppState.antigravityCreds.updateBatchControls();
 }
 function batchAntigravityAction(action) { AppState.antigravityCreds.batchAction(action); }
+function batchAntigravityBindProxy() {
+    AppState.antigravityCreds.batchBindProxy(document.getElementById('antigravityBatchProxySelect')?.value || '');
+}
 function downloadAntigravityCred(filename) {
     fetch(`./creds/download/${filename}?mode=antigravity`, { headers: getAuthHeaders() })
         .then(r => r.ok ? r.blob() : Promise.reject())
@@ -1513,7 +1678,7 @@ async function downloadAllAntigravityCreds() {
             showStatus('✅ 所有Antigravity凭证已打包下载', 'success');
         }
     } catch (error) {
-        showStatus(`网络错误: ${error.message}`, 'error');
+        showStatus(`保存配置失败: ${error.message}`, 'error');
     }
 }
 
@@ -2714,8 +2879,10 @@ async function loadConfig() {
         if (response.ok) {
             AppState.currentConfig = data.config;
             AppState.envLockedFields = new Set(data.env_locked || []);
+            AppState.proxyPoolLoaded = true;
 
             populateConfigForm();
+            populateProxyBindSelects();
             form.classList.remove('hidden');
             showStatus('配置加载成功', 'success');
         } else {
@@ -2738,6 +2905,7 @@ function populateConfigForm() {
     setConfigField('configPassword', c.password || 'pwd');
     setConfigField('credentialsDir', c.credentials_dir || '');
     setConfigField('proxy', c.proxy || '');
+    setConfigField('proxyPool', JSON.stringify(c.proxy_pool || [], null, 2));
     setConfigField('codeAssistEndpoint', c.code_assist_endpoint || '');
     setConfigField('oauthProxyUrl', c.oauth_proxy_url || '');
     setConfigField('googleapisProxyUrl', c.googleapis_proxy_url || '');
@@ -2784,6 +2952,14 @@ async function saveConfig() {
         const getInt = (id, def = 0) => parseInt(document.getElementById(id)?.value) || def;
         const getFloat = (id, def = 0.0) => parseFloat(document.getElementById(id)?.value) || def;
         const getChecked = (id, def = false) => document.getElementById(id)?.checked || def;
+        const parseProxyPool = () => {
+            const raw = getValue('proxyPool', '[]');
+            try {
+                return raw ? JSON.parse(raw) : [];
+            } catch {
+                throw new Error('代理池必须是有效的 JSON 数组');
+            }
+        };
 
         const config = {
             host: getValue('host', '0.0.0.0'),
@@ -2794,6 +2970,7 @@ async function saveConfig() {
             code_assist_endpoint: getValue('codeAssistEndpoint'),
             credentials_dir: getValue('credentialsDir'),
             proxy: getValue('proxy'),
+            proxy_pool: parseProxyPool(),
             oauth_proxy_url: getValue('oauthProxyUrl'),
             googleapis_proxy_url: getValue('googleapisProxyUrl'),
             resource_manager_api_url: getValue('resourceManagerApiUrl'),

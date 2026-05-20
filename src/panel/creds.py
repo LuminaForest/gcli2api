@@ -17,13 +17,15 @@ from log import log
 from src.credential_manager import credential_manager
 from src.models import (
     CredFileActionRequest,
-    CredFileBatchActionRequest
+    CredFileBatchActionRequest,
+    CredProxyBindRequest,
 )
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token, GEMINICLI_USER_AGENT, ANTIGRAVITY_USER_AGENT
 from src.api.antigravity import fetch_quota_info
+from src.proxy_config import get_credential_proxy_request_kwargs
 from src.google_oauth_api import Credentials, fetch_project_id_and_tier
-from config import get_code_assist_endpoint, get_antigravity_api_url
+from config import get_code_assist_endpoint, get_antigravity_api_url, get_proxy_pool_config
 from .utils import validate_mode
 
 
@@ -34,6 +36,19 @@ router = APIRouter(prefix="/creds", tags=["credentials"])
 # =============================================================================
 # 工具函数 (Helper Functions)
 # =============================================================================
+
+
+async def normalize_bound_proxy_name(proxy_name: str | None) -> str | None:
+    """Validate a proxy name from the configured proxy pool."""
+    proxy_name = (proxy_name or "").strip()
+    if not proxy_name:
+        return None
+
+    proxy_pool = await get_proxy_pool_config()
+    if not any(item["name"] == proxy_name for item in proxy_pool):
+        raise HTTPException(status_code=400, detail=f"代理不存在: {proxy_name}")
+
+    return proxy_name
 
 
 async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
@@ -279,6 +294,7 @@ async def get_creds_status_common(
             "backend_type": backend_type,
             "model_cooldowns": summary.get("model_cooldowns", {}),
             "tier": summary.get("tier", "pro"),
+            "proxy_name": summary.get("proxy_name"),
         }
 
         if mode == "geminicli":
@@ -549,7 +565,10 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
     credentials = Credentials.from_dict(credential_data)
 
     # 确保token有效（自动刷新）
-    token_refreshed = await credentials.refresh_if_needed()
+    proxy_kwargs = await get_credential_proxy_request_kwargs(
+        filename, mode=mode, request_label="oauth_refresh"
+    )
+    token_refreshed = await credentials.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
     # 如果token被刷新了，更新存储
     if token_refreshed:
@@ -565,6 +584,8 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
         api_base_url = await get_code_assist_endpoint()
         user_agent = GEMINICLI_USER_AGENT
 
+    proxy_kwargs["_proxy_log"]["request_label"] = "verify_project"
+
     # 重新获取project id（仅 antigravity 模式请求积分）
     if mode == "antigravity":
         project_id, subscription_tier, credit_amount = await fetch_project_id_and_tier(
@@ -572,12 +593,14 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
             user_agent=user_agent,
             api_base_url=api_base_url,
             include_credits=True,
+            proxy_kwargs=proxy_kwargs,
         )
     else:
         project_id, subscription_tier = await fetch_project_id_and_tier(
             access_token=credentials.access_token,
             user_agent=user_agent,
             api_base_url=api_base_url,
+            proxy_kwargs=proxy_kwargs,
         )
         credit_amount = None
 
@@ -862,6 +885,48 @@ async def creds_action(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/proxy-bind")
+async def bind_credential_proxy(
+    request: CredProxyBindRequest,
+    token: str = Depends(verify_panel_token),
+    mode: str = "geminicli"
+):
+    """绑定或解绑单个凭证的代理。"""
+    try:
+        mode = validate_mode(mode)
+        filename = request.filename
+        if not filename.endswith(".json"):
+            raise HTTPException(status_code=400, detail="无效的文件名")
+
+        proxy_name = await normalize_bound_proxy_name(request.proxy_name)
+
+        storage_adapter = await get_storage_adapter()
+        credential_data = await storage_adapter.get_credential(filename, mode=mode)
+        if not credential_data:
+            raise HTTPException(status_code=404, detail="凭证不存在")
+
+        updated = await storage_adapter.update_credential_state(
+            filename, {"proxy_name": proxy_name}, mode=mode
+        )
+        if not updated:
+            raise HTTPException(status_code=500, detail="代理绑定保存失败，可能凭证不存在")
+
+        action_label = f"绑定代理 {proxy_name}" if proxy_name else "解绑代理"
+        log.info(f"凭证代理已更新: {filename} (mode={mode}, proxy_name={proxy_name or '-'})")
+        return JSONResponse(content={
+            "success": True,
+            "filename": os.path.basename(filename),
+            "proxy_name": proxy_name,
+            "message": f"已为 {os.path.basename(filename)} {action_label}",
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"绑定凭证代理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/batch-action")
 async def creds_batch_action(
     request: CredFileBatchActionRequest,
@@ -882,6 +947,9 @@ async def creds_batch_action(
 
         success_count = 0
         errors = []
+        proxy_name = None
+        if action == "bind_proxy":
+            proxy_name = await normalize_bound_proxy_name(request.proxy_name)
 
         storage_adapter = await get_storage_adapter()
 
@@ -946,6 +1014,15 @@ async def creds_batch_action(
                         success_count += 1
                     else:
                         errors.append(f"{filename}: 关闭信用额度模式失败")
+                        continue
+                elif action == "bind_proxy":
+                    updated = await storage_adapter.update_credential_state(
+                        filename, {"proxy_name": proxy_name}, mode=mode
+                    )
+                    if updated:
+                        success_count += 1
+                    else:
+                        errors.append(f"{filename}: 代理绑定失败")
                         continue
                 else:
                     errors.append(f"{filename}: 无效的操作类型")
@@ -1173,7 +1250,10 @@ async def get_credential_quota(
         creds = Credentials.from_dict(credential_data)
 
         # 自动刷新 token（如果需要）
-        await creds.refresh_if_needed()
+        proxy_kwargs = await get_credential_proxy_request_kwargs(
+            filename, mode=mode, request_label="oauth_refresh"
+        )
+        await creds.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
         # 如果 token 被刷新了，更新存储
         updated_data = creds.to_dict()
@@ -1188,7 +1268,8 @@ async def get_credential_quota(
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
         # 获取额度信息
-        quota_info = await fetch_quota_info(access_token)
+        proxy_kwargs["_proxy_log"]["request_label"] = "antigravity_quota"
+        quota_info = await fetch_quota_info(access_token, proxy_kwargs=proxy_kwargs)
 
         if quota_info.get("success"):
             return JSONResponse(content={
@@ -1254,7 +1335,10 @@ async def configure_preview_channel(
 
         # 创建凭证对象并刷新 token（如果需要）
         credentials = Credentials.from_dict(credential_data)
-        token_refreshed = await credentials.refresh_if_needed()
+        proxy_kwargs = await get_credential_proxy_request_kwargs(
+            filename, mode=mode, request_label="configure_preview"
+        )
+        token_refreshed = await credentials.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
         if token_refreshed:
             log.info(f"Token已自动刷新: {filename}")
@@ -1296,7 +1380,8 @@ async def configure_preview_channel(
             json={"release_channel": "EXPERIMENTAL"},
             headers=headers,
             params={"release_channel_setting_id": setting_id},
-            timeout=30.0
+            timeout=30.0,
+            **proxy_kwargs
         )
 
         setting_status = setting_response.status_code
@@ -1333,7 +1418,8 @@ async def configure_preview_channel(
             },
             headers=headers,
             params={"setting_binding_id": binding_id},
-            timeout=30.0
+            timeout=30.0,
+            **proxy_kwargs
         )
 
         binding_status = binding_response.status_code
@@ -1426,7 +1512,10 @@ async def test_credential(
 
         # 创建凭证对象并尝试刷新 token（如果需要）
         credentials = Credentials.from_dict(credential_data)
-        token_refreshed = await credentials.refresh_if_needed()
+        proxy_kwargs = await get_credential_proxy_request_kwargs(
+            filename, mode=mode, request_label="oauth_refresh"
+        )
+        token_refreshed = await credentials.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
         # 如果 token 被刷新了，更新存储
         if token_refreshed:
@@ -1465,6 +1554,7 @@ async def test_credential(
             }
 
         # 第一次测试：使用 gemini-2.5-flash
+        proxy_kwargs["_proxy_log"]["request_label"] = "credential_test"
         response = await post_async(
             url=f"{api_base_url}/v1internal:generateContent",
             json={
@@ -1476,7 +1566,8 @@ async def test_credential(
                 }
             },
             headers=headers,
-            timeout=30.0
+            timeout=30.0,
+            **proxy_kwargs
         )
 
         # 返回实际的状态码和详细信息
@@ -1508,7 +1599,8 @@ async def test_credential(
                                 }
                             },
                             headers=headers,
-                            timeout=30.0
+                            timeout=30.0,
+                            **proxy_kwargs
                         )
 
                         preview_status = preview_response.status_code

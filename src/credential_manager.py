@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from log import log
 
 from src.google_oauth_api import Credentials
+from src.proxy_config import get_credential_proxy_request_kwargs
 from src.storage_adapter import get_storage_adapter
 
 class CredentialManager:
@@ -216,7 +217,10 @@ class CredentialManager:
                 return None
 
             # 自动刷新 token（如果需要）
-            token_refreshed = await credentials.refresh_if_needed()
+            proxy_kwargs = await get_credential_proxy_request_kwargs(
+                credential_name, mode=mode, request_label="fetch_user_email"
+            )
+            token_refreshed = await credentials.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
             # 如果 token 被刷新了，更新存储
             if token_refreshed:
@@ -225,7 +229,7 @@ class CredentialManager:
                 await self._storage_adapter.store_credential(credential_name, updated_data, mode=mode)
 
             # 获取邮箱
-            email = await get_user_email(credentials)
+            email = await get_user_email(credentials, proxy_kwargs=proxy_kwargs)
 
             if email:
                 # 缓存邮箱地址
@@ -377,7 +381,10 @@ class CredentialManager:
 
             # 刷新token
             log.debug(f"正在刷新token: {filename} (mode={mode})")
-            await creds.refresh()
+            proxy_kwargs = await get_credential_proxy_request_kwargs(
+                filename, mode=mode, request_label="oauth_refresh"
+            )
+            await creds.refresh(proxy_kwargs=proxy_kwargs)
 
             # 更新凭证数据
             if creds.access_token:

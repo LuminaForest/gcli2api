@@ -59,7 +59,7 @@ class Credentials:
         buffer = timedelta(minutes=3)
         return (self.expires_at - buffer) <= datetime.now(timezone.utc)
 
-    async def refresh_if_needed(self) -> bool:
+    async def refresh_if_needed(self, proxy_kwargs: Optional[Dict[str, Any]] = None) -> bool:
         """如果需要则刷新token"""
         if not self.is_expired():
             return False
@@ -67,10 +67,10 @@ class Credentials:
         if not self.refresh_token:
             raise TokenError("需要刷新令牌但未提供")
 
-        await self.refresh()
+        await self.refresh(proxy_kwargs=proxy_kwargs)
         return True
 
-    async def refresh(self):
+    async def refresh(self, proxy_kwargs: Optional[Dict[str, Any]] = None):
         """刷新访问令牌"""
         if not self.refresh_token:
             raise TokenError("无刷新令牌")
@@ -89,6 +89,7 @@ class Credentials:
                 token_url,
                 data=data,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                **(proxy_kwargs or {}),
             )
             response.raise_for_status()
 
@@ -329,15 +330,19 @@ class ServiceAccount:
 
 
 # 工具函数
-async def get_user_info(credentials: Credentials) -> Optional[Dict[str, Any]]:
+async def get_user_info(
+    credentials: Credentials, proxy_kwargs: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
     """获取用户信息"""
-    await credentials.refresh_if_needed()
+    await credentials.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
     try:
         googleapis_base_url = await get_googleapis_proxy_url()
         userinfo_url = f"{googleapis_base_url.rstrip('/')}/oauth2/v2/userinfo"
         response = await get_async(
-            userinfo_url, headers={"Authorization": f"Bearer {credentials.access_token}"}
+            userinfo_url,
+            headers={"Authorization": f"Bearer {credentials.access_token}"},
+            **(proxy_kwargs or {}),
         )
         response.raise_for_status()
         return response.json()
@@ -346,14 +351,16 @@ async def get_user_info(credentials: Credentials) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def get_user_email(credentials: Credentials) -> Optional[str]:
+async def get_user_email(
+    credentials: Credentials, proxy_kwargs: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
     """获取用户邮箱地址"""
     try:
         # 确保凭证有效
-        await credentials.refresh_if_needed()
+        await credentials.refresh_if_needed(proxy_kwargs=proxy_kwargs)
 
         # 调用Google userinfo API获取邮箱
-        user_info = await get_user_info(credentials)
+        user_info = await get_user_info(credentials, proxy_kwargs=proxy_kwargs)
         if user_info:
             email = user_info.get("email")
             if email:
@@ -536,6 +543,7 @@ async def fetch_project_id_and_tier(
     user_agent: str,
     api_base_url: str,
     include_credits: bool = False,
+    proxy_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str]] | Tuple[Optional[str], Optional[str], Optional[int]]:
     """
     从 API 获取 project_id 和订阅等级
@@ -579,7 +587,9 @@ async def fetch_project_id_and_tier(
 
     # 步骤 1: 尝试 loadCodeAssist
     try:
-        project_id, raw_tier, raw_credit_amount = await _try_load_code_assist(api_base_url, headers)
+        project_id, raw_tier, raw_credit_amount = await _try_load_code_assist(
+            api_base_url, headers, proxy_kwargs=proxy_kwargs
+        )
         subscription_tier = _map_raw_tier(raw_tier)
 
         if raw_credit_amount is not None:
@@ -611,7 +621,7 @@ async def fetch_project_id_and_tier(
 
     # 步骤 2: 回退到 onboardUser
     try:
-        project_id = await _try_onboard_user(api_base_url, headers)
+        project_id = await _try_onboard_user(api_base_url, headers, proxy_kwargs=proxy_kwargs)
         if project_id:
             if include_credits:
                 return project_id, subscription_tier, credit_amount
@@ -633,7 +643,8 @@ async def fetch_project_id_and_tier(
 
 async def _try_load_code_assist(
     api_base_url: str,
-    headers: dict
+    headers: dict,
+    proxy_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     尝试通过 loadCodeAssist 获取 project_id 和订阅等级
@@ -658,6 +669,7 @@ async def _try_load_code_assist(
         json=request_body,
         headers=headers,
         timeout=30.0,
+        **(proxy_kwargs or {}),
     )
 
     log.debug(f"[loadCodeAssist] Response status: {response.status_code}")
@@ -715,7 +727,8 @@ async def _try_load_code_assist(
 
 async def _try_onboard_user(
     api_base_url: str,
-    headers: dict
+    headers: dict,
+    proxy_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
     尝试通过 onboardUser 获取 project_id（长时间运行操作，需要轮询）
@@ -726,7 +739,7 @@ async def _try_onboard_user(
     request_url = f"{api_base_url.rstrip('/')}/v1internal:onboardUser"
 
     # 首先需要获取用户的 tier 信息
-    tier_id = await _get_onboard_tier(api_base_url, headers)
+    tier_id = await _get_onboard_tier(api_base_url, headers, proxy_kwargs=proxy_kwargs)
     if not tier_id:
         log.error("[onboardUser] Failed to determine user tier")
         return None
@@ -761,6 +774,7 @@ async def _try_onboard_user(
             json=request_body,
             headers=headers,
             timeout=30.0,
+            **(proxy_kwargs or {}),
         )
 
         log.debug(f"[onboardUser] Response status: {response.status_code}")
@@ -804,7 +818,8 @@ async def _try_onboard_user(
 
 async def _get_onboard_tier(
     api_base_url: str,
-    headers: dict
+    headers: dict,
+    proxy_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
     从 loadCodeAssist 响应中获取用户应该注册的 tier
@@ -828,6 +843,7 @@ async def _get_onboard_tier(
         json=request_body,
         headers=headers,
         timeout=30.0,
+        **(proxy_kwargs or {}),
     )
 
     if response.status_code == 200:
@@ -848,5 +864,3 @@ async def _get_onboard_tier(
     else:
         log.error(f"[_get_onboard_tier] Failed to fetch tier info: HTTP {response.status_code}")
         return None
-
-

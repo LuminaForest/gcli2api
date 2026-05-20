@@ -27,6 +27,7 @@ class SQLiteManager:
         "preview",
         "tier",
         "enable_credit",
+        "proxy_name",
     }
 
     # 所有必需的列定义（用于自动校验和修复）
@@ -37,6 +38,7 @@ class SQLiteManager:
             ("error_messages", "TEXT DEFAULT '[]'"),
             ("last_success", "REAL"),
             ("user_email", "TEXT"),
+            ("proxy_name", "TEXT"),
             ("model_cooldowns", "TEXT DEFAULT '{}'"),
             ("preview", "INTEGER DEFAULT 1"),
             ("tier", "TEXT DEFAULT 'pro'"),
@@ -51,6 +53,7 @@ class SQLiteManager:
             ("error_messages", "TEXT DEFAULT '[]'"),
             ("last_success", "REAL"),
             ("user_email", "TEXT"),
+            ("proxy_name", "TEXT"),
             ("model_cooldowns", "TEXT DEFAULT '{}'"),
             ("tier", "TEXT DEFAULT 'pro'"),
             ("enable_credit", "INTEGER DEFAULT 0"),
@@ -168,6 +171,7 @@ class SQLiteManager:
                 error_messages TEXT DEFAULT '[]',
                 last_success REAL,
                 user_email TEXT,
+                proxy_name TEXT,
 
                 -- 模型级 CD 支持 (JSON: {model_name: cooldown_timestamp})
                 model_cooldowns TEXT DEFAULT '{}',
@@ -201,6 +205,7 @@ class SQLiteManager:
                 error_messages TEXT DEFAULT '[]',
                 last_success REAL,
                 user_email TEXT,
+                proxy_name TEXT,
 
                 -- 模型级 CD 支持 (JSON: {model_name: cooldown_timestamp})
                 model_cooldowns TEXT DEFAULT '{}',
@@ -691,22 +696,23 @@ class SQLiteManager:
                 # 精确匹配
                 if mode == "geminicli":
                     async with db.execute(f"""
-                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns, preview, tier
+                        SELECT disabled, error_codes, last_success, user_email, proxy_name, model_cooldowns, preview, tier
                         FROM {table_name} WHERE filename = ?
                     """, (filename,)) as cursor:
                         row = await cursor.fetchone()
 
                         if row:
                             error_codes_json = row[1] or '[]'
-                            model_cooldowns_json = row[4] or '{}'
+                            model_cooldowns_json = row[5] or '{}'
                             return {
                                 "disabled": bool(row[0]),
                                 "error_codes": json.loads(error_codes_json),
                                 "last_success": row[2] or time.time(),
                                 "user_email": row[3],
+                                "proxy_name": row[4],
                                 "model_cooldowns": json.loads(model_cooldowns_json),
-                                "preview": bool(row[5]) if row[5] is not None else True,
-                                "tier": row[6] if row[6] is not None else "pro",
+                                "preview": bool(row[6]) if row[6] is not None else True,
+                                "tier": row[7] if row[7] is not None else "pro",
                             }
 
                     # 返回默认状态
@@ -715,6 +721,7 @@ class SQLiteManager:
                         "error_codes": [],
                         "last_success": time.time(),
                         "user_email": None,
+                        "proxy_name": None,
                         "model_cooldowns": {},
                         "preview": True,
                         "tier": "pro",
@@ -722,22 +729,23 @@ class SQLiteManager:
                 else:
                     # antigravity 模式
                     async with db.execute(f"""
-                        SELECT disabled, error_codes, last_success, user_email, model_cooldowns, tier, enable_credit
+                        SELECT disabled, error_codes, last_success, user_email, proxy_name, model_cooldowns, tier, enable_credit
                         FROM {table_name} WHERE filename = ?
                     """, (filename,)) as cursor:
                         row = await cursor.fetchone()
 
                         if row:
                             error_codes_json = row[1] or '[]'
-                            model_cooldowns_json = row[4] or '{}'
+                            model_cooldowns_json = row[5] or '{}'
                             return {
                                 "disabled": bool(row[0]),
                                 "error_codes": json.loads(error_codes_json),
                                 "last_success": row[2] or time.time(),
                                 "user_email": row[3],
+                                "proxy_name": row[4],
                                 "model_cooldowns": json.loads(model_cooldowns_json),
-                                "tier": row[5] if row[5] is not None else "pro",
-                                "enable_credit": bool(row[6]) if row[6] is not None else False,
+                                "tier": row[6] if row[6] is not None else "pro",
+                                "enable_credit": bool(row[7]) if row[7] is not None else False,
                             }
 
                     # 返回默认状态
@@ -746,6 +754,7 @@ class SQLiteManager:
                         "error_codes": [],
                         "last_success": time.time(),
                         "user_email": None,
+                        "proxy_name": None,
                         "model_cooldowns": {},
                         "tier": "pro",
                         "enable_credit": False,
@@ -765,7 +774,7 @@ class SQLiteManager:
                 if mode == "geminicli":
                     async with db.execute(f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, model_cooldowns, preview, tier
+                               user_email, proxy_name, model_cooldowns, preview, tier
                         FROM {table_name}
                     """) as cursor:
                         rows = await cursor.fetchall()
@@ -776,7 +785,7 @@ class SQLiteManager:
                         for row in rows:
                             filename = row[0]
                             error_codes_json = row[2] or '[]'
-                            model_cooldowns_json = row[5] or '{}'
+                            model_cooldowns_json = row[6] or '{}'
                             model_cooldowns = json.loads(model_cooldowns_json)
 
                             # 自动过滤掉已过期的模型CD
@@ -791,9 +800,10 @@ class SQLiteManager:
                                 "error_codes": json.loads(error_codes_json),
                                 "last_success": row[3] or time.time(),
                                 "user_email": row[4],
+                                "proxy_name": row[5],
                                 "model_cooldowns": model_cooldowns,
-                                "preview": bool(row[6]) if row[6] is not None else True,
-                                "tier": row[7] if row[7] is not None else "pro",
+                                "preview": bool(row[7]) if row[7] is not None else True,
+                                "tier": row[8] if row[8] is not None else "pro",
                             }
 
                         return states
@@ -801,7 +811,7 @@ class SQLiteManager:
                     # antigravity 模式
                     async with db.execute(f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, model_cooldowns, tier, enable_credit
+                               user_email, proxy_name, model_cooldowns, tier, enable_credit
                         FROM {table_name}
                     """) as cursor:
                         rows = await cursor.fetchall()
@@ -812,7 +822,7 @@ class SQLiteManager:
                         for row in rows:
                             filename = row[0]
                             error_codes_json = row[2] or '[]'
-                            model_cooldowns_json = row[5] or '{}'
+                            model_cooldowns_json = row[6] or '{}'
                             model_cooldowns = json.loads(model_cooldowns_json)
 
                             # 自动过滤掉已过期的模型CD
@@ -827,9 +837,10 @@ class SQLiteManager:
                                 "error_codes": json.loads(error_codes_json),
                                 "last_success": row[3] or time.time(),
                                 "user_email": row[4],
+                                "proxy_name": row[5],
                                 "model_cooldowns": model_cooldowns,
-                                "tier": row[6] if row[6] is not None else "pro",
-                                "enable_credit": bool(row[7]) if row[7] is not None else False,
+                                "tier": row[7] if row[7] is not None else "pro",
+                                "enable_credit": bool(row[8]) if row[8] is not None else False,
                             }
 
                         return states
@@ -916,7 +927,7 @@ class SQLiteManager:
                 if mode == "geminicli":
                     all_query = f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, rotation_order, model_cooldowns, preview, tier
+                               user_email, rotation_order, model_cooldowns, preview, tier, proxy_name
                         FROM {table_name}
                         {where_clause}
                         ORDER BY rotation_order
@@ -924,7 +935,7 @@ class SQLiteManager:
                 else:
                     all_query = f"""
                         SELECT filename, disabled, error_codes, last_success,
-                               user_email, rotation_order, model_cooldowns, tier, enable_credit
+                               user_email, rotation_order, model_cooldowns, tier, enable_credit, proxy_name
                         FROM {table_name}
                         {where_clause}
                         ORDER BY rotation_order
@@ -981,6 +992,7 @@ class SQLiteManager:
                             "user_email": row[4],
                             "rotation_order": row[5],
                             "model_cooldowns": active_cooldowns,
+                            "proxy_name": row[9],
                             "tier": row[8] if mode == "geminicli" and row[8] is not None else (
                                 row[7] if mode != "geminicli" and row[7] is not None else "pro"
                             ),

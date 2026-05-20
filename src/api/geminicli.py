@@ -23,6 +23,7 @@ from log import log
 
 from src.credential_manager import credential_manager
 from src.httpx_client import stream_post_async, post_async
+from src.proxy_config import get_credential_proxy_request_kwargs
 
 # 导入共同的基础功能
 from src.api.utils import (
@@ -219,11 +220,15 @@ async def stream_request(
         need_retry = False  # 标记是否需要重试
 
         try:
+            proxy_kwargs = await get_credential_proxy_request_kwargs(
+                current_file, mode="geminicli", request_label="geminicli_stream"
+            )
             async for chunk in stream_post_async(
                 url=target_url,
                 body=final_payload,
                 native=native,
-                headers=auth_headers
+                headers=auth_headers,
+                **proxy_kwargs
             ):
                 # 判断是否是Response对象
                 if isinstance(chunk, Response):
@@ -505,11 +510,15 @@ async def non_stream_request(
 
     for attempt in range(max_retries + 1):
         try:
+            proxy_kwargs = await get_credential_proxy_request_kwargs(
+                current_file, mode="geminicli", request_label="geminicli_generate"
+            )
             response = await post_async(
                 url=target_url,
                 json=final_payload,
                 headers=auth_headers,
-                timeout=300.0
+                timeout=300.0,
+                **proxy_kwargs
             )
 
             status_code = response.status_code

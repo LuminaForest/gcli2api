@@ -19,6 +19,7 @@ from log import log
 
 from src.credential_manager import credential_manager
 from src.httpx_client import stream_post_async, post_async
+from src.proxy_config import get_credential_proxy_request_kwargs
 from src.models import Model, model_to_dict
 from src.utils import ANTIGRAVITY_USER_AGENT
 
@@ -222,11 +223,15 @@ async def stream_request(
         need_retry = False  # 标记是否需要重试
 
         try:
+            proxy_kwargs = await get_credential_proxy_request_kwargs(
+                current_file, mode="antigravity", request_label="antigravity_stream"
+            )
             async for chunk in stream_post_async(
                 url=target_url,
                 body=final_payload,
                 native=native,
-                headers=auth_headers
+                headers=auth_headers,
+                **proxy_kwargs
             ):
                 # 判断是否是Response对象
                 if isinstance(chunk, Response):
@@ -514,11 +519,15 @@ async def non_stream_request(
         need_retry = False  # 标记是否需要重试
         
         try:
+            proxy_kwargs = await get_credential_proxy_request_kwargs(
+                current_file, mode="antigravity", request_label="antigravity_generate"
+            )
             response = await post_async(
                 url=target_url,
                 json=final_payload,
                 headers=auth_headers,
-                timeout=300.0
+                timeout=300.0,
+                **proxy_kwargs
             )
 
             status_code = response.status_code
@@ -702,11 +711,15 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
     try:
         # 使用 POST 请求获取模型列表
         antigravity_url = await get_antigravity_api_url()
+        proxy_kwargs = await get_credential_proxy_request_kwargs(
+            current_file, mode="antigravity", request_label="antigravity_models"
+        )
 
         response = await post_async(
             url=f"{antigravity_url}/v1internal:fetchAvailableModels",
             json={},  # 空的请求体
-            headers=headers
+            headers=headers,
+            **proxy_kwargs
         )
 
         if response.status_code == 200:
@@ -759,7 +772,9 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
         return []
 
 
-async def fetch_quota_info(access_token: str) -> Dict[str, Any]:
+async def fetch_quota_info(
+    access_token: str, proxy_kwargs: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     获取指定凭证的额度信息
     
@@ -790,7 +805,8 @@ async def fetch_quota_info(access_token: str) -> Dict[str, Any]:
             url=f"{antigravity_url}/v1internal:fetchAvailableModels",
             json={},
             headers=headers,
-            timeout=30.0
+            timeout=30.0,
+            **(proxy_kwargs or {})
         )
 
         if response.status_code == 200:

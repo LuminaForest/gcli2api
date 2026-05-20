@@ -373,6 +373,12 @@ class CredFileActionRequest(BaseModel):
 class CredFileBatchActionRequest(BaseModel):
     action: str  # "enable", "disable", "delete"
     filenames: List[str]  # 批量操作的文件名列表
+    proxy_name: Optional[str] = None  # bind_proxy 使用，空值表示解绑
+
+
+class CredProxyBindRequest(BaseModel):
+    filename: str
+    proxy_name: Optional[str] = None  # 空值表示解绑
 
 
 class ConfigSaveRequest(BaseModel):
