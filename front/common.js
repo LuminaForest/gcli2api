@@ -846,21 +846,21 @@ function createCredCard(credInfo, manager) {
 
     // 操作按钮
     const missingProxyOption = boundProxyName && !proxyPool.some(proxy => proxy.name === boundProxyName)
-        ? `<option value="${escapeHtml(boundProxyName)}" selected>${escapeHtml(boundProxyName)}（不存在）</option>`
+        ? `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${escapeHtml(boundProxyName)}" style="padding: 6px 10px; border: none; background: transparent; text-align: left; cursor: pointer; color: #c62828;">${escapeHtml(boundProxyName)}（不存在）</button>`
         : '';
-    const proxyOptions = '<option value="">继承全局代理</option>' + missingProxyOption + proxyPool.map(proxy => {
-        const selected = proxy.name === boundProxyName ? ' selected' : '';
+    const proxyOptions = `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="" style="padding: 6px 10px; border: none; background: ${boundProxyName ? 'transparent' : '#e8f0fe'}; text-align: left; cursor: pointer;">继承全局代理</button>` + missingProxyOption + proxyPool.map(proxy => {
+        const selectedStyle = proxy.name === boundProxyName ? 'background: #e8f0fe;' : 'background: transparent;';
         const name = escapeHtml(proxy.name);
         const title = escapeHtml(maskProxyUrl(proxy.url));
-        return `<option value="${name}" title="${title}"${selected}>${name}</option>`;
+        return `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${name}" title="${title}" style="padding: 6px 10px; border: none; ${selectedStyle} text-align: left; cursor: pointer;">${name}</button>`;
     }).join('');
     const proxySelector = `
-        <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #555;">
-            代理
-            <select class="cred-proxy-select" data-proxy-bind data-filename="${filename}" style="height: 30px; border: 1px solid #ddd; border-radius: 4px; padding: 0 6px;">
+        <span style="position: relative; display: inline-flex;">
+            <button type="button" class="cred-btn" data-proxy-menu-toggle="${pathId}" title="当前代理: ${escapeHtml(boundProxyName || '继承全局代理')}">代理设置</button>
+            <span id="proxy-menu-${pathId}" data-proxy-menu style="display: none; position: absolute; left: 0; top: calc(100% + 4px); z-index: 30; min-width: 150px; max-height: 220px; overflow-y: auto; padding: 6px; border: 1px solid #dfe3e8; border-radius: 8px; background: #fff; box-shadow: 0 8px 20px rgba(0,0,0,0.12);">
                 ${proxyOptions}
-            </select>
-        </label>
+            </span>
+        </span>
     `;
     const actionButtons = `
         ${proxySelector}
@@ -932,9 +932,26 @@ function createCredCard(credInfo, manager) {
         });
     });
 
-    div.querySelectorAll('[data-proxy-bind]').forEach(select => {
-        select.addEventListener('change', function () {
-            manager.bindProxy(this.getAttribute('data-filename'), this.value);
+    div.querySelectorAll('[data-proxy-menu-toggle]').forEach(button => {
+        button.addEventListener('click', function (event) {
+            event.stopPropagation();
+            const menu = div.querySelector(`#proxy-menu-${this.getAttribute('data-proxy-menu-toggle')}`);
+            if (!menu) return;
+            div.querySelectorAll('[data-proxy-menu]').forEach(otherMenu => {
+                if (otherMenu !== menu) otherMenu.style.display = 'none';
+            });
+            menu.style.display = menu.style.display === 'none' ? 'grid' : 'none';
+            menu.style.gap = '4px';
+        });
+    });
+
+    div.querySelectorAll('[data-proxy-bind]').forEach(button => {
+        button.addEventListener('click', function (event) {
+            event.stopPropagation();
+            div.querySelectorAll('[data-proxy-menu]').forEach(menu => {
+                menu.style.display = 'none';
+            });
+            manager.bindProxy(this.getAttribute('data-filename'), this.getAttribute('data-proxy-name') || '');
         });
     });
 
