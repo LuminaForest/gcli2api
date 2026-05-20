@@ -214,7 +214,7 @@
         }
 
         .tabs {
-            display: inline-flex;
+            display: flex;
             background: linear-gradient(145deg, #f5f5f7, #e8e8ed);
             padding: 6px;
             border-radius: 14px;
@@ -222,7 +222,8 @@
             border-bottom: none;
             gap: 3px;
             overflow-x: auto;
-            max-width: 100%;
+            width: 100%;
+            box-sizing: border-box;
             user-select: none;
             box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.06),
                 0 1px 2px rgba(255, 255, 255, 0.9);
@@ -291,6 +292,9 @@
             font-weight: 450;
             transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
             white-space: nowrap;
+            flex: 1 0 auto;
+            min-width: max-content;
+            text-align: center;
             position: relative;
             overflow: hidden;
             z-index: 1;
@@ -1384,7 +1388,6 @@
                 <button class="tab" onclick="switchTab('antigravity-manage')">Antigravity凭证管理</button>
                 <button class="tab" onclick="switchTab('config')">配置管理</button>
                 <button class="tab" onclick="switchTab('logs')">实时日志</button>
-                <button class="tab" onclick="switchTab('about')">项目信息</button>
             </div>
 
             <!-- OAuth认证标签页 -->
@@ -2061,7 +2064,7 @@
                                 <label for="proxyPool">凭证代理池:</label>
                                 <textarea id="proxyPool" class="config-input" rows="6"
                                     placeholder='[{"name":"hk-1","url":"http://proxy:7890"}]'></textarea>
-                                <small class="config-note">JSON数组。凭证可绑定 name；请求时使用对应 url，未绑定则继承上方全局代理。</small>
+                                <small class="config-note">JSON数组。凭证可绑定 name；url格式示例：http://user:password@host:port，也支持 http://host:port:user:password；未绑定则继承上方全局代理。</small>
                             </div>
                         </div>
 
@@ -2325,87 +2328,8 @@
                 </div>
             </div>
 
-            <!-- 项目信息标签页 -->
-            <div id="aboutTab" class="tab-content">
-                <h3>项目信息</h3>
-                <p>关于GCLI2API项目的详细信息和支持方式</p>
-
-                <!-- 项目介绍 -->
-                <div
-                    style="background-color: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #007bff;">
-                    <h4 style="margin-top: 0; color: #007bff;">📋 项目简介</h4>
-                    <p style="margin: 10px 0; line-height: 1.6; color: #495057;">
-                        GCLI2API是一个将Google Gemini API转换为OpenAI 和GEMINI API格式的代理工具，支持多账户管理、自动轮换、实时日志监控等功能。
-                    </p>
-                    <div style="margin: 15px 0;">
-                        <p style="margin: 5px 0;"><strong>🔗 项目地址：</strong> <a
-                                href="https://github.com/su-kaka/gcli2api" target="_blank"
-                                style="color: #007bff; text-decoration: none;">GitHub - su-kaka/gcli2api</a></p>
-                        <p style="margin: 5px 0;"><strong>⚠️ 使用声明：</strong> <span
-                                style="color: #dc3545; font-weight: 500;">禁止商业用途和倒卖 - 仅供学习使用</span></p>
-                    </div>
-                </div>
-
-                <!-- 功能特性 -->
-                <div
-                    style="background-color: #e7f3ff; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #17a2b8;">
-                    <h4 style="margin-top: 0; color: #17a2b8;">✨ 主要功能</h4>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">
-                        <div>
-                            <p><strong>🔄 多账户管理：</strong> 支持批量上传和管理多个Google账户</p>
-                            <p><strong>⚡ 自动轮换：</strong> 智能轮换账户，避免单账户限额</p>
-                            <p><strong>📊 实时监控：</strong> 使用统计、错误监控、实时日志</p>
-                        </div>
-                        <div>
-                            <p><strong>🛡️ 安全可靠：</strong> OAuth2认证、自动封禁异常账户</p>
-                            <p><strong>🎛️ 配置灵活：</strong> 支持热更新配置、代理设置</p>
-                            <p><strong>📱 界面友好：</strong> 响应式设计、移动端适配</p>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 交流群 -->
-                <div
-                    style="background-color: #e7f3ff; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #4285f4; text-align: center;">
-                    <h4 style="margin-top: 0; color: #1976d2;">💬 交流群</h4>
-                    <div style="color: #1565c0; line-height: 1.6;">
-                        <p>欢迎加入 QQ 群交流讨论！</p>
-                        <p style="font-size: 18px; font-weight: bold; color: #4285f4;">QQ 群号：1083250744</p>
-                    </div>
-                    <div
-                        style="display: inline-block; background: white; padding: 15px; border-radius: 12px; box-shadow: 0 2px 15px rgba(0,0,0,0.1); margin-top: 10px;">
-                        <img src="docs/qq群.jpg" alt="QQ群二维码"
-                            style="width: 200px; height: 200px; border-radius: 8px; display: block;">
-                        <p
-                            style="color: #666; margin: 10px 0 0 0; font-size: 13px; font-weight: 600; text-align: center;">
-                            扫码加入QQ群</p>
-                    </div>
-                </div>
-
-                <!-- 联系和反馈 -->
-                <div
-                    style="background-color: #d1ecf1; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #bee5eb;">
-                    <h4 style="margin-top: 0; color: #0c5460;">📞 联系我们</h4>
-                    <div style="color: #0c5460; line-height: 1.6;">
-                        <p>• <strong>问题反馈：</strong> 通过GitHub Issues提交问题和建议</p>
-                        <p>• <strong>功能请求：</strong> 在GitHub Discussions中讨论新功能</p>
-                        <p>• <strong>代码贡献：</strong> 欢迎提交Pull Request改进项目</p>
-                        <p>• <strong>文档完善：</strong> 帮助改进项目文档和使用指南</p>
-                    </div>
-                </div>
-            </div>
-
             <div id="statusSection"></div>
 
-            <!-- 项目信息 -->
-            <div
-                style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 12px; margin-top: 30px; text-align: center; border-left: 4px solid #007bff;">
-                <p style="margin: 5px 0; font-size: 14px; color: #495057;">GitHub: <a
-                        href="https://github.com/su-kaka/gcli2api" target="_blank"
-                        style="color: #007bff; text-decoration: none;">https://github.com/su-kaka/gcli2api</a></p>
-                <p style="margin: 5px 0; font-size: 14px; color: #dc3545; font-weight: 500;">⚠️ 禁止商业用途和倒卖 - 仅供学习使用 ⚠️
-                </p>
-            </div>
         </div>
     </div>
 
