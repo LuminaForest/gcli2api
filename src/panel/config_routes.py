@@ -31,6 +31,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["code_assist_endpoint"] = await config.get_code_assist_endpoint()
         current_config["credentials_dir"] = await config.get_credentials_dir()
         current_config["proxy"] = await config.get_proxy_config() or ""
+        current_config["credential_proxy_generator_url"] = await config.get_credential_proxy_generator_url()
         current_config["proxy_pool"] = await config.get_proxy_pool_config()
 
         # 代理端点配置
@@ -140,6 +141,14 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 new_config["proxy_pool"] = config.normalize_proxy_pool(new_config["proxy_pool"])
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
+
+        if "credential_proxy_generator_url" in new_config:
+            generator_url = str(new_config["credential_proxy_generator_url"] or "").strip()
+            if generator_url and not (
+                generator_url.startswith("http://") or generator_url.startswith("https://")
+            ):
+                raise HTTPException(status_code=400, detail="凭证代理生成链接必须以 http:// 或 https:// 开头")
+            new_config["credential_proxy_generator_url"] = generator_url
 
         if "compatibility_mode_enabled" in new_config:
             if not isinstance(new_config["compatibility_mode_enabled"], bool):

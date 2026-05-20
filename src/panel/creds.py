@@ -23,6 +23,11 @@ from src.models import (
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token, GEMINICLI_USER_AGENT, ANTIGRAVITY_USER_AGENT
 from src.api.antigravity import fetch_quota_info
+from src.api.utils import (
+    PROXY_ERROR_CODE,
+    format_request_exception_message,
+    is_proxy_request_exception,
+)
 from src.proxy_config import get_credential_proxy_request_kwargs
 from src.google_oauth_api import Credentials, fetch_project_id_and_tier
 from config import get_code_assist_endpoint, get_antigravity_api_url, get_proxy_pool_config
@@ -49,6 +54,38 @@ async def normalize_bound_proxy_name(proxy_name: str | None) -> str | None:
         raise HTTPException(status_code=400, detail=f"代理不存在: {proxy_name}")
 
     return proxy_name
+
+
+async def record_panel_proxy_error(storage_adapter, filename: str, mode: str, error_message: str) -> None:
+    """Persist proxy errors for the credential list and error details panel."""
+    updated = await storage_adapter.update_credential_state(
+        filename,
+        {
+            "error_codes": [PROXY_ERROR_CODE],
+            "error_messages": {str(PROXY_ERROR_CODE): error_message},
+        },
+        mode=mode,
+    )
+    if updated:
+        log.info(f"已保存代理异常信息: {filename} (mode={mode}) - {error_message}")
+    else:
+        log.warning(f"保存代理异常信息失败，凭证可能不存在: {filename} (mode={mode})")
+
+
+def extract_response_error_text(response) -> str:
+    """Extract top-level error text from a JSON response body, if present."""
+    try:
+        data = response.json()
+    except Exception:
+        return ""
+
+    if not isinstance(data, dict) or "error" not in data:
+        return ""
+
+    error = data["error"]
+    if isinstance(error, str):
+        return error
+    return json.dumps(error, ensure_ascii=False)
 
 
 async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
@@ -1174,6 +1211,20 @@ async def verify_credential_project(
         raise
     except Exception as e:
         log.error(f"检验凭证Project ID失败 {filename}: {e}")
+        if is_proxy_request_exception(e):
+            storage_adapter = await get_storage_adapter()
+            error_message = format_request_exception_message("检验失败", e)
+            await record_panel_proxy_error(storage_adapter, filename, mode, error_message)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "status_code": PROXY_ERROR_CODE,
+                    "message": "代理异常",
+                    "error": error_message,
+                    "filename": filename,
+                }
+            )
         raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
 
 
@@ -1395,6 +1446,8 @@ async def configure_preview_channel(
             # 步骤 1 失败
             error_text = setting_response.text if hasattr(setting_response, 'text') else ""
             log.error(f"步骤 1/2 失败: {filename} - Status: {setting_status}, Error: {error_text}")
+            if "代理异常" in error_text:
+                await record_panel_proxy_error(storage_adapter, filename, mode, error_text)
 
             return JSONResponse(
                 status_code=setting_status,
@@ -1457,6 +1510,8 @@ async def configure_preview_channel(
             # 步骤 2 失败
             error_text = binding_response.text if hasattr(binding_response, 'text') else ""
             log.error(f"步骤 2/2 失败: {filename} - Status: {binding_status}, Error: {error_text}")
+            if "代理异常" in error_text:
+                await record_panel_proxy_error(storage_adapter, filename, mode, error_text)
 
             return JSONResponse(
                 status_code=binding_status,
@@ -1474,6 +1529,20 @@ async def configure_preview_channel(
         raise
     except Exception as e:
         log.error(f"配置 preview 通道失败 {filename}: {e}")
+        if is_proxy_request_exception(e):
+            storage_adapter = await get_storage_adapter()
+            error_message = format_request_exception_message("配置失败", e)
+            await record_panel_proxy_error(storage_adapter, filename, mode, error_message)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "filename": filename,
+                    "preview": False,
+                    "message": "代理异常",
+                    "error": error_message,
+                }
+            )
         raise HTTPException(status_code=500, detail=f"配置失败: {str(e)}")
 
 
@@ -1572,6 +1641,28 @@ async def test_credential(
 
         # 返回实际的状态码和详细信息
         status_code = response.status_code
+        response_error_text = extract_response_error_text(response)
+
+        if status_code == 200 and response_error_text:
+            error_code = PROXY_ERROR_CODE if "代理异常" in response_error_text else 500
+            await storage_adapter.update_credential_state(filename, {
+                "error_codes": [error_code],
+                "error_messages": {str(error_code): response_error_text}
+            }, mode=mode)
+            log.warning(
+                f"凭证测试返回200但包含错误: {filename} "
+                f"(mode={mode}, error_code={error_code}, error={response_error_text})"
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "status_code": error_code,
+                    "message": "代理异常" if error_code == PROXY_ERROR_CODE else "测试失败",
+                    "error": response_error_text,
+                    "filename": filename
+                }
+            )
 
         if status_code == 200 or status_code == 429:
             log.info(f"凭证测试成功: {filename} (mode={mode}, model={test_model}, status={status_code})")
@@ -1622,6 +1713,19 @@ async def test_credential(
                             log.warning(f"Preview 模型测试失败: {filename} (status={preview_status})")
                     except Exception as e:
                         log.error(f"Preview 模型测试异常: {filename} - {e}")
+                        if is_proxy_request_exception(e):
+                            error_message = format_request_exception_message("测试失败", e)
+                            await record_panel_proxy_error(storage_adapter, filename, mode, error_message)
+                            return JSONResponse(
+                                status_code=500,
+                                content={
+                                    "success": False,
+                                    "status_code": PROXY_ERROR_CODE,
+                                    "message": "代理异常",
+                                    "error": error_message,
+                                    "filename": filename
+                                }
+                            )
 
             # 返回成功响应
             return JSONResponse(
@@ -1643,8 +1747,9 @@ async def test_credential(
                 log.error(f"凭证测试错误详情 - 文件: {filename}, 模式: {mode}, 状态码: {status_code}, 错误内容: {error_text}")
 
                 # 使用覆盖模式保存错误（与 credential_manager 保持一致）
-                error_codes = [status_code]
-                error_messages = {str(status_code): error_text if error_text else f"HTTP {status_code}"}
+                error_code = PROXY_ERROR_CODE if "代理异常" in error_text else status_code
+                error_codes = [error_code]
+                error_messages = {str(error_code): error_text if error_text else f"HTTP {status_code}"}
 
                 # 更新状态
                 await storage_adapter.update_credential_state(filename, {
@@ -1652,7 +1757,7 @@ async def test_credential(
                     "error_messages": error_messages
                 }, mode=mode)
 
-                log.info(f"已保存测试错误信息: {filename} - 错误码 {status_code}")
+                log.info(f"已保存测试错误信息: {filename} - 错误码 {error_code}")
             except Exception as e:
                 log.error(f"保存测试错误信息失败: {e}")
 
@@ -1674,4 +1779,18 @@ async def test_credential(
         raise
     except Exception as e:
         log.error(f"测试凭证失败 {filename}: {e}")
+        if is_proxy_request_exception(e):
+            storage_adapter = await get_storage_adapter()
+            error_message = format_request_exception_message("测试失败", e)
+            await record_panel_proxy_error(storage_adapter, filename, mode, error_message)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "status_code": PROXY_ERROR_CODE,
+                    "message": "代理异常",
+                    "error": error_message,
+                    "filename": filename,
+                }
+            )
         raise HTTPException(status_code=500, detail=f"测试失败: {str(e)}")

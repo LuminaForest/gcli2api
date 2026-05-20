@@ -23,6 +23,7 @@ class HttpxClientManager:
         """获取httpx客户端的通用配置参数"""
         explicit_proxy = kwargs.pop("proxy", None)
         proxy_log = kwargs.pop("_proxy_log", None)
+        kwargs.pop("_proxy_refresh_attempted", None)
         client_kwargs = {"timeout": timeout, **kwargs}
 
         proxy_source = "none"
@@ -181,6 +182,52 @@ async def _log_httpx_error(
     log.error(f"[HTTPX] {action} failed: url={url}, error={error_msg}")
 
 
+async def _refresh_proxy_for_retry(
+    action: str,
+    url: str,
+    exc: Exception,
+    request_kwargs: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not _is_proxy_transport_error(exc, request_kwargs):
+        return None
+
+    try:
+        from src.proxy_config import refresh_bound_proxy_url_once
+
+        new_proxy_url = await refresh_bound_proxy_url_once(request_kwargs, exc)
+        if not new_proxy_url:
+            return None
+
+        retry_kwargs = {**request_kwargs, "proxy": new_proxy_url, "_proxy_refresh_attempted": True}
+        log.info(f"[HTTPX] {action} retrying once with refreshed credential proxy: url={url}")
+        return retry_kwargs
+    except Exception as refresh_error:
+        log.warning(f"[HTTPX] {action} proxy refresh failed: url={url}, error={refresh_error}")
+        return None
+
+
+def _is_proxy_transport_error(exc: Exception, request_kwargs: Dict[str, Any]) -> bool:
+    """Treat transport failures on proxied requests as proxy failures."""
+    if not request_kwargs.get("proxy"):
+        return isinstance(exc, httpx.ProxyError)
+
+    exc_module = exc.__class__.__module__
+    exc_text = str(exc)
+    return isinstance(exc, httpx.ProxyError) or (
+        isinstance(exc, httpx.TransportError)
+        or exc_module.startswith("socksio")
+        or "Malformed reply" in exc_text
+    )
+
+
+def _raise_proxy_transport_error(exc: Exception, request_kwargs: Dict[str, Any]) -> None:
+    if isinstance(exc, httpx.ProxyError):
+        raise exc
+    if _is_proxy_transport_error(exc, request_kwargs):
+        raise httpx.ProxyError(str(exc), request=getattr(exc, "request", None)) from exc
+    raise exc
+
+
 # 全局HTTP客户端管理器实例
 http_client = HttpxClientManager()
 
@@ -190,12 +237,23 @@ async def get_async(
     url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0, **kwargs
 ) -> httpx.Response:
     """通用异步GET请求"""
-    async with http_client.get_client(timeout=timeout, **kwargs) as client:
-        try:
+    async def request_once(request_kwargs: Dict[str, Any]) -> httpx.Response:
+        async with http_client.get_client(timeout=timeout, **request_kwargs) as client:
             return await client.get(url, headers=headers)
-        except httpx.HTTPError as e:
-            await _log_httpx_error("GET", url, e, kwargs)
-            raise
+
+    try:
+        return await request_once(kwargs)
+    except Exception as e:
+        retry_kwargs = await _refresh_proxy_for_retry("GET", url, e, kwargs)
+        if retry_kwargs:
+            try:
+                return await request_once(retry_kwargs)
+            except Exception as retry_error:
+                await _log_httpx_error("GET", url, retry_error, retry_kwargs)
+                _raise_proxy_transport_error(retry_error, retry_kwargs)
+
+        await _log_httpx_error("GET", url, e, kwargs)
+        _raise_proxy_transport_error(e, kwargs)
 
 
 async def post_async(
@@ -207,12 +265,23 @@ async def post_async(
     **kwargs,
 ) -> httpx.Response:
     """通用异步POST请求"""
-    async with http_client.get_client(timeout=timeout, **kwargs) as client:
-        try:
+    async def request_once(request_kwargs: Dict[str, Any]) -> httpx.Response:
+        async with http_client.get_client(timeout=timeout, **request_kwargs) as client:
             return await client.post(url, data=data, json=json, headers=headers)
-        except httpx.HTTPError as e:
-            await _log_httpx_error("POST", url, e, kwargs)
-            raise
+
+    try:
+        return await request_once(kwargs)
+    except Exception as e:
+        retry_kwargs = await _refresh_proxy_for_retry("POST", url, e, kwargs)
+        if retry_kwargs:
+            try:
+                return await request_once(retry_kwargs)
+            except Exception as retry_error:
+                await _log_httpx_error("POST", url, retry_error, retry_kwargs)
+                _raise_proxy_transport_error(retry_error, retry_kwargs)
+
+        await _log_httpx_error("POST", url, e, kwargs)
+        _raise_proxy_transport_error(e, kwargs)
 
 
 # 调试用：设为 True 时所有流式请求都返回 429
@@ -236,8 +305,8 @@ async def stream_post_async(
         )
         return
 
-    async with http_client.get_streaming_client(**kwargs) as client:
-        try:
+    async def stream_once(request_kwargs: Dict[str, Any]):
+        async with http_client.get_streaming_client(**request_kwargs) as client:
             async with client.stream("POST", url, json=body, headers=headers) as r:
                 # 错误直接返回
                 if r.status_code != 200:
@@ -253,6 +322,20 @@ async def stream_post_async(
                     # 通过aiter_lines转化成str流返回
                     async for line in r.aiter_lines():
                         yield line
-        except httpx.HTTPError as e:
-            await _log_httpx_error("STREAM_POST", url, e, kwargs)
-            raise
+
+    try:
+        async for chunk in stream_once(kwargs):
+            yield chunk
+    except Exception as e:
+        retry_kwargs = await _refresh_proxy_for_retry("STREAM_POST", url, e, kwargs)
+        if retry_kwargs:
+            try:
+                async for chunk in stream_once(retry_kwargs):
+                    yield chunk
+                return
+            except Exception as retry_error:
+                await _log_httpx_error("STREAM_POST", url, retry_error, retry_kwargs)
+                _raise_proxy_transport_error(retry_error, retry_kwargs)
+
+        await _log_httpx_error("STREAM_POST", url, e, kwargs)
+        _raise_proxy_transport_error(e, kwargs)

@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+import httpx
 from fastapi import Response
 
 from config import (
@@ -21,7 +22,44 @@ from log import log
 from src.credential_manager import CredentialManager
 
 
+PROXY_ERROR_CODE = 599
+
+
 # ==================== 错误检查与处理 ====================
+
+def _find_proxy_request_exception(exc: Exception) -> Optional[httpx.ProxyError]:
+    """Return the underlying httpx proxy error when one exists."""
+    if isinstance(exc, httpx.ProxyError):
+        return exc
+
+    cause = getattr(exc, "__cause__", None)
+    if cause:
+        proxy_error = _find_proxy_request_exception(cause)
+        if proxy_error:
+            return proxy_error
+
+    context = getattr(exc, "__context__", None)
+    if context:
+        proxy_error = _find_proxy_request_exception(context)
+        if proxy_error:
+            return proxy_error
+
+    return None
+
+
+def is_proxy_request_exception(exc: Exception) -> bool:
+    """Return True when the outbound request failed in the configured proxy."""
+    return _find_proxy_request_exception(exc) is not None
+
+
+def format_request_exception_message(prefix: str, exc: Exception) -> str:
+    """Format outbound request exceptions for API responses."""
+    proxy_error = _find_proxy_request_exception(exc)
+    if proxy_error:
+        detail = str(proxy_error).strip()
+        return f"代理异常: {detail}" if detail else "代理异常"
+    return f"{prefix}: {str(exc)}"
+
 
 async def check_should_auto_ban(status_code: int) -> bool:
     """
@@ -195,6 +233,28 @@ async def record_api_call_error(
             model_name=model_name,
             error_message=error_message
         )
+
+
+async def record_proxy_request_error(
+    credential_manager: CredentialManager,
+    credential_name: str,
+    mode: str,
+    model_name: Optional[str],
+    exc: Exception,
+    response_prefix: str,
+) -> str:
+    """Record proxy errors without triggering credential retry/auto-ban logic."""
+    error_message = format_request_exception_message(response_prefix, exc)
+    await record_api_call_error(
+        credential_manager,
+        credential_name,
+        PROXY_ERROR_CODE,
+        None,
+        mode=mode,
+        model_name=model_name,
+        error_message=error_message,
+    )
+    return error_message
 
 
 # ==================== 429错误处理 ====================

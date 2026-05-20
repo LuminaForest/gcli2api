@@ -767,7 +767,8 @@ function createCredCard(credInfo, manager) {
         : '<span class="status-badge enabled">已启用</span>';
 
     if (status.error_codes && status.error_codes.length > 0) {
-        statusBadges += `<span class="error-codes">错误码: ${status.error_codes.join(', ')}</span>`;
+        const displayErrors = status.error_codes.map(c => Number(c) === 599 ? '代理异常' : `错误码 ${c}`);
+        statusBadges += `<span class="error-codes">${displayErrors.join(', ')}</span>`;
         const autoBan = status.error_codes.filter(c => c === 400 || c === 403);
         if (autoBan.length > 0 && status.disabled) {
             statusBadges += '<span class="status-badge" style="background-color: #e74c3c; color: white;">AUTO_BAN</span>';
@@ -1812,6 +1813,7 @@ async function verifyProjectId(filename) {
             const errorMsg = data.message || '检验失败';
             showStatus(`❌ ${errorMsg}`, 'error');
             showMessageModal('检验失败', `❌ 检验失败\n\n${errorMsg}`, 'error');
+            await AppState.creds.refresh();
         }
     } catch (error) {
         const errorMsg = `检验失败: ${error.message}`;
@@ -1849,6 +1851,7 @@ async function verifyAntigravityProjectId(filename) {
             const errorMsg = data.message || '检验失败';
             showStatus(`❌ ${errorMsg}`, 'error');
             showMessageModal('检验失败', `❌ 检验失败\n\n${errorMsg}`, 'error');
+            await AppState.antigravityCreds.refresh();
         }
     } catch (error) {
         const errorMsg = `检验失败: ${error.message}`;
@@ -1897,6 +1900,7 @@ async function testCredential(filename) {
 
             showStatus(`❌ 测试失败 - ${data.message || '错误码: ' + (data.status_code || response.status)}`, 'error');
             showMessageModal('测试失败', errorDetails, 'error');
+            await AppState.creds.refresh();
         }
     } catch (error) {
         const errorMsg = `测试失败: ${error.message}`;
@@ -1945,6 +1949,7 @@ async function testAntigravityCredential(filename) {
 
             showStatus(`❌ 测试失败 - ${data.message || '错误码: ' + (data.status_code || response.status)}`, 'error');
             showMessageModal('测试失败', errorDetails, 'error');
+            await AppState.antigravityCreds.refresh();
         }
     } catch (error) {
         const errorMsg = `测试失败: ${error.message}`;
@@ -1989,6 +1994,7 @@ async function configurePreviewChannel(filename) {
 
             showStatus(`❌ ${errorMsg}`, 'error');
             showMessageModal('Preview通道配置失败', alertMsg, 'error');
+            await AppState.creds.refresh();
         }
     } catch (error) {
         const errorMsg = `配置Preview通道失败: ${error.message}`;
@@ -2166,6 +2172,7 @@ async function toggleErrorDetailsCommon(pathId, manager) {
                         // 遍历所有错误码，从 errorMessages 对象中获取对应消息
                         errorCodes.forEach((errorCode) => {
                             const messageStr = errorMessages[errorCode] || '无详细信息';
+                            const errorTitle = Number(errorCode) === 599 ? '代理异常' : `错误码: ${errorCode}`;
 
                             // 提取核心错误消息和详细信息
                             let displayMsg = messageStr;
@@ -2235,7 +2242,7 @@ async function toggleErrorDetailsCommon(pathId, manager) {
 
                             errorHTML += `
                                 <div style="padding: 12px; margin-bottom: 10px; border-left: 3px solid #dc3545; background-color: #f8f9fa;">
-                                    <div style="font-weight: bold; color: #dc3545; margin-bottom: 8px;">错误码: ${errorCode}</div>
+                                    <div style="font-weight: bold; color: #dc3545; margin-bottom: 8px;">${errorTitle}</div>
                                     <div style="line-height: 1.6; color: #333; white-space: pre-wrap; word-break: break-word;">
                                         ${highlightedMsg}
                                     </div>
@@ -2923,6 +2930,7 @@ function populateConfigForm() {
     setConfigField('credentialsDir', c.credentials_dir || '');
     setConfigField('proxy', c.proxy || '');
     setConfigField('proxyPool', JSON.stringify(c.proxy_pool || [], null, 2));
+    setConfigField('credentialProxyGeneratorUrl', c.credential_proxy_generator_url || '');
     setConfigField('codeAssistEndpoint', c.code_assist_endpoint || '');
     setConfigField('oauthProxyUrl', c.oauth_proxy_url || '');
     setConfigField('googleapisProxyUrl', c.googleapis_proxy_url || '');
@@ -2988,6 +2996,7 @@ async function saveConfig() {
             credentials_dir: getValue('credentialsDir'),
             proxy: getValue('proxy'),
             proxy_pool: parseProxyPool(),
+            credential_proxy_generator_url: getValue('credentialProxyGeneratorUrl'),
             oauth_proxy_url: getValue('oauthProxyUrl'),
             googleapis_proxy_url: getValue('googleapisProxyUrl'),
             resource_manager_api_url: getValue('resourceManagerApiUrl'),

@@ -1772,6 +1772,14 @@
                                 <small
                                     style="display: block; color: #666; font-size: 12px; margin-top: 5px;">JSON数组。url格式示例：http://user:password@host:port，也支持 http://host:port:user:password；未绑定则继承全局代理。</small>
                             </div>
+
+                            <div class="form-group">
+                                <label for="credentialProxyGeneratorUrl">凭证代理生成链接:</label>
+                                <input type="text" id="credentialProxyGeneratorUrl"
+                                    placeholder="例如: https://webipapi.cliproxy.com/api/getIpInfo" />
+                                <small
+                                    style="display: block; color: #666; font-size: 12px; margin-top: 5px;">绑定代理池中的代理异常时，调用该链接获取新的代理URL，替换对应代理池条目并只重试一次；留空则禁用。</small>
+                            </div>
                         </div>
 
                         <div class="card">
@@ -2061,7 +2069,7 @@
     </div>
 
     <!-- 引入公共JavaScript模块 -->
-    <script src="./front/common.js?v=proxy-pool-2"></script>
+    <script src="./front/common.js?v=proxy-generator-1"></script>
 </body>
 
 </html>

@@ -29,6 +29,7 @@ ENV_MAPPINGS = {
     "CODE_ASSIST_ENDPOINT": "code_assist_endpoint",
     "CREDENTIALS_DIR": "credentials_dir",
     "PROXY": "proxy",
+    "CREDENTIAL_PROXY_GENERATOR_URL": "credential_proxy_generator_url",
     "OAUTH_PROXY_URL": "oauth_proxy_url",
     "GOOGLEAPIS_PROXY_URL": "googleapis_proxy_url",
     "RESOURCE_MANAGER_API_URL": "resource_manager_api_url",
@@ -120,6 +121,16 @@ async def get_proxy_config():
     """Get proxy configuration."""
     proxy_url = await get_config_value("proxy", env_var="PROXY")
     return proxy_url if proxy_url else None
+
+
+async def get_credential_proxy_generator_url() -> str:
+    """Get URL used to generate replacement credential proxy URLs."""
+    url = await get_config_value(
+        "credential_proxy_generator_url",
+        "",
+        "CREDENTIAL_PROXY_GENERATOR_URL",
+    )
+    return str(url or "").strip()
 
 
 def validate_proxy_url(proxy_url: str) -> str:

@@ -31,6 +31,9 @@ from src.api.utils import (
     record_api_call_error,
     parse_and_log_cooldown,
     collect_streaming_response,
+    format_request_exception_message,
+    is_proxy_request_exception,
+    record_proxy_request_error,
 )
 
 # ==================== 全局凭证管理器 ====================
@@ -362,6 +365,22 @@ async def stream_request(
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {e}, 凭证: {current_file}")
+            if is_proxy_request_exception(e):
+                log.error("[ANTIGRAVITY STREAM] 检测到代理异常，终止重试")
+                error_message = await record_proxy_request_error(
+                    credential_manager,
+                    current_file,
+                    "antigravity",
+                    model_name,
+                    e,
+                    "流式请求异常",
+                )
+                yield Response(
+                    content=json.dumps({"error": error_message}),
+                    status_code=500,
+                    media_type="application/json"
+                )
+                return
             if attempt < max_retries:
                 log.info(f"[ANTIGRAVITY STREAM] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 await asyncio.sleep(retry_interval)
@@ -369,12 +388,14 @@ async def stream_request(
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）
                 log.error(f"[ANTIGRAVITY STREAM] 所有重试均失败，最后异常: {e}")
-                if last_error_response:
+                if last_error_response and not is_proxy_request_exception(e):
                     yield last_error_response
                 else:
                     # 如果没有记录到错误响应，返回500错误
                     yield Response(
-                        content=json.dumps({"error": f"流式请求异常: {str(e)}"}),
+                        content=json.dumps({
+                            "error": format_request_exception_message("流式请求异常", e)
+                        }),
                         status_code=500,
                         media_type="application/json"
                     )
@@ -652,6 +673,21 @@ async def non_stream_request(
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY] 非流式请求异常: {e}, 凭证: {current_file}")
+            if is_proxy_request_exception(e):
+                log.error("[ANTIGRAVITY] 检测到代理异常，终止重试")
+                error_message = await record_proxy_request_error(
+                    credential_manager,
+                    current_file,
+                    "antigravity",
+                    model_name,
+                    e,
+                    "非流式请求异常",
+                )
+                return Response(
+                    content=json.dumps({"error": error_message}),
+                    status_code=500,
+                    media_type="application/json"
+                )
             if attempt < max_retries:
                 log.info(f"[ANTIGRAVITY] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 await asyncio.sleep(retry_interval)
@@ -659,11 +695,13 @@ async def non_stream_request(
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
                 log.error(f"[ANTIGRAVITY] 所有重试均失败，最后异常: {e}")
-                if last_error_response:
+                if last_error_response and not is_proxy_request_exception(e):
                     return last_error_response
                 else:
                     return Response(
-                        content=json.dumps({"error": f"非流式请求异常: {str(e)}"}),
+                        content=json.dumps({
+                            "error": format_request_exception_message("非流式请求异常", e)
+                        }),
                         status_code=500,
                         media_type="application/json"
                     )

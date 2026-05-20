@@ -123,7 +123,7 @@ class Credentials:
             log.error(error_msg)
             token_error = TokenError(error_msg)
             token_error.status_code = status_code
-            raise token_error
+            raise token_error from e
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Credentials":
@@ -244,7 +244,7 @@ class Flow:
         except Exception as e:
             error_msg = f"获取token失败: {str(e)}"
             log.error(error_msg)
-            raise TokenError(error_msg)
+            raise TokenError(error_msg) from e
 
 
 class ServiceAccount:
@@ -316,7 +316,7 @@ class ServiceAccount:
         except Exception as e:
             error_msg = f"Service Account获取token失败: {str(e)}"
             log.error(error_msg)
-            raise TokenError(error_msg)
+            raise TokenError(error_msg) from e
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], scopes: List[str] = None) -> "ServiceAccount":
