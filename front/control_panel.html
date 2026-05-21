@@ -465,10 +465,10 @@
 
         .cred-header {
             display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
+            flex-direction: column;
+            align-items: stretch;
             margin-bottom: 10px;
-            gap: 20px;
+            gap: 8px;
         }
 
         .cred-filename {
@@ -485,6 +485,21 @@
         .cred-status {
             display: flex;
             gap: 5px;
+            flex-wrap: wrap;
+            width: 100%;
+        }
+
+        .cred-status-row {
+            display: block;
+            width: 100%;
+        }
+
+        .cred-identity-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            min-width: 0;
         }
 
         .status-badge {
@@ -2336,7 +2351,7 @@
     </div>
 
     <!-- 引入公共JavaScript模块 -->
-    <script src="./front/common.js?v=proxy-generator-1"></script>
+    <script src="./front/common.js?v=proxy-generator-3"></script>
 
 </body>
 

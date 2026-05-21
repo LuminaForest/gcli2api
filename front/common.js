@@ -893,14 +893,16 @@ function createCredCard(credInfo, manager) {
 
     div.innerHTML = `
         <div class="cred-header">
-            <div style="display: flex; align-items: center; gap: 10px;">
+            <div class="cred-status-row">
+                <div class="cred-status">${statusBadges}</div>
+            </div>
+            <div class="cred-identity-row">
                 <input type="checkbox" class="${checkboxClass}" data-filename="${filename}" onchange="toggle${managerType === 'antigravity' ? 'Antigravity' : ''}FileSelection('${filename}')">
-                <div>
+                <div style="min-width: 0; flex: 1;">
                     <div class="cred-filename">${filename}</div>
                     ${emailInfo}
                 </div>
             </div>
-            <div class="cred-status">${statusBadges}</div>
         </div>
         <div class="cred-actions">${actionButtons}</div>
         <div class="cred-details" id="details-${pathId}">
