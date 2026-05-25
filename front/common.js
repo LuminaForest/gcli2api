@@ -118,8 +118,8 @@ function createCredsManager(type) {
 
                 if (response.ok) {
                     this.data = {};
-                    data.items.forEach(item => {
-                        this.data[item.filename] = {
+	                    data.items.forEach(item => {
+	                        this.data[item.filename] = {
                             filename: item.filename,
                             status: {
                                 disabled: item.disabled,
@@ -131,11 +131,12 @@ function createCredsManager(type) {
                             preview: item.preview,
                             tier: item.tier || 'pro',
                             enable_credit: !!item.enable_credit,
-                            proxy_name: item.proxy_name || ''
-                        };
-                    });
+	                            proxy_name: item.proxy_name || ''
+	                        };
+	                    });
+	                    mergeProxyBindingsFromCredentialItems(data.items || [], type === 'antigravity' ? 'antigravity' : 'geminicli');
 
-                    this.totalCount = data.total;
+	                    this.totalCount = data.total;
                     // 使用后端返回的全局统计数据
                     if (data.stats) {
                         this.statsData = data.stats;
@@ -700,6 +701,25 @@ function addProxyBinding(bindings, proxyName, mode, filename) {
     bindings[proxyName] = list;
 }
 
+function mergeProxyBindingsFromCredentialItems(items, mode) {
+    items = items || [];
+    const filenames = new Set(items.map(item => String(item.filename || '').trim()).filter(Boolean));
+    const bindings = {};
+
+    Object.entries(getProxyPoolBindings()).forEach(([proxyName, proxyBindings]) => {
+        const keptBindings = (Array.isArray(proxyBindings) ? proxyBindings : [])
+            .filter(item => item.mode !== mode || !filenames.has(String(item.filename || '').trim()));
+        if (keptBindings.length) {
+            bindings[proxyName] = keptBindings;
+        }
+    });
+
+    items.forEach(item => {
+        addProxyBinding(bindings, item.proxy_name, mode, item.filename);
+    });
+    AppState.currentConfig.proxy_bindings = bindings;
+}
+
 async function refreshProxyPoolBindingsFromCredentialStatus() {
     const bindings = {};
     Object.entries(getProxyPoolBindings()).forEach(([proxyName, items]) => {
@@ -1133,7 +1153,13 @@ function createCredCard(credInfo, manager) {
         const selectedStyle = proxy.name === boundProxyName ? 'background: #e8f0fe;' : 'background: transparent;';
         const name = escapeHtml(proxy.name);
         const title = escapeHtml(maskProxyUrl(proxy.url));
-        return `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${name}" title="${title}" style="padding: 6px 10px; border: none; ${selectedStyle} text-align: left; cursor: pointer;">${name}</button>`;
+        const bindings = getProxyBindings(proxy.name);
+        const bindingText = bindings.length > 0 ? `已绑定 ${bindings.length}` : '未绑定';
+        const bindingColor = bindings.length > 0 ? '#1a73e8' : '#607d8b';
+        return `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${name}" title="${title}" style="display: flex; justify-content: space-between; gap: 12px; padding: 6px 10px; border: none; ${selectedStyle} text-align: left; cursor: pointer;">
+            <span>${name}</span>
+            <span style="color: ${bindingColor}; font-size: 11px; white-space: nowrap;">${bindingText}</span>
+        </button>`;
     }).join('');
     const proxySelector = `
         <span style="position: relative; display: inline-flex;">
