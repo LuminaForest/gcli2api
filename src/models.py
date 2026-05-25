@@ -383,6 +383,17 @@ class CredProxyBindRequest(BaseModel):
 
 class ProxyPoolGenerateRequest(BaseModel):
     generator_url: Optional[str] = None
+    scheme: Optional[str] = "socks5"
+
+
+class BatchGenerateLoginRequest(BaseModel):
+    email: str
+    password: str
+    two_fa_key: Optional[str] = None
+    phone: Optional[str] = None
+    phone_code_url: Optional[str] = None
+    proxy_url: Optional[str] = None
+    line_number: Optional[int] = None
 
 
 class ConfigSaveRequest(BaseModel):

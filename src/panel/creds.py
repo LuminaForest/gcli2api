@@ -1345,12 +1345,7 @@ async def get_credential_quota(
         raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
 
 
-@router.post("/configure-preview/{filename}")
-async def configure_preview_channel(
-    filename: str,
-    token: str = Depends(verify_panel_token),
-    mode: str = "geminicli"
-):
+async def configure_preview_channel_common(filename: str, mode: str = "geminicli") -> dict:
     """
     为 geminicli 凭证配置 preview 通道
 
@@ -1361,22 +1356,22 @@ async def configure_preview_channel(
         mode: 凭证模式（仅支持 geminicli）
 
     Returns:
-        配置结果信息
+        dict: 包含 success / message / preview / status_code 等字段
     """
+    mode = validate_mode(mode)
+
+    # 只支持 geminicli 模式
+    if mode != "geminicli":
+        raise HTTPException(
+            status_code=400,
+            detail="配置 preview 通道仅支持 geminicli 模式"
+        )
+
+    # 验证文件名
+    if not filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="无效的文件名")
+
     try:
-        mode = validate_mode(mode)
-
-        # 只支持 geminicli 模式
-        if mode != "geminicli":
-            raise HTTPException(
-                status_code=400,
-                detail="配置 preview 通道仅支持 geminicli 模式"
-            )
-
-        # 验证文件名
-        if not filename.endswith(".json"):
-            raise HTTPException(status_code=400, detail="无效的文件名")
-
         storage_adapter = await get_storage_adapter()
 
         # 获取凭证数据
@@ -1441,7 +1436,7 @@ async def configure_preview_channel(
             log.info(f"步骤 1/2: Release Channel Setting 创建成功 (setting_id={setting_id})")
         elif setting_status == 409:
             # Setting 已存在，继续下一步
-            log.info(f"步骤 1/2: Release Channel Setting 已存在")
+            log.info("步骤 1/2: Release Channel Setting 已存在")
         else:
             # 步骤 1 失败
             error_text = setting_response.text if hasattr(setting_response, 'text') else ""
@@ -1449,17 +1444,15 @@ async def configure_preview_channel(
             if "代理异常" in error_text:
                 await record_panel_proxy_error(storage_adapter, filename, mode, error_text)
 
-            return JSONResponse(
-                status_code=setting_status,
-                content={
-                    "success": False,
-                    "filename": filename,
-                    "preview": False,
-                    "message": f"创建 Release Channel Setting 失败: HTTP {setting_status}",
-                    "error": error_text,
-                    "step": "create_setting"
-                }
-            )
+            return {
+                "success": False,
+                "filename": filename,
+                "preview": False,
+                "message": f"创建 Release Channel Setting 失败: HTTP {setting_status}",
+                "error": error_text,
+                "step": "create_setting",
+                "status_code": setting_status,
+            }
 
         # 步骤 2: 创建 Setting Binding (绑定到当前项目)
         binding_url = f"{base_url}/releaseChannelSettings/{setting_id}/settingBindings"
@@ -1484,15 +1477,16 @@ async def configure_preview_channel(
 
             log.info(f"步骤 2/2: Setting Binding 创建成功 - Preview 通道配置完成: {filename}")
 
-            return JSONResponse(content={
+            return {
                 "success": True,
                 "filename": filename,
                 "preview": True,
                 "message": "Preview 通道配置成功，已将 preview 属性设置为 true",
                 "setting_id": setting_id,
-                "binding_id": binding_id
-            })
-        elif binding_status == 409:
+                "binding_id": binding_id,
+                "status_code": 200,
+            }
+        if binding_status == 409:
             # Binding 已存在，说明已经配置过了
             await storage_adapter.update_credential_state(filename, {
                 "preview": True
@@ -1500,30 +1494,29 @@ async def configure_preview_channel(
 
             log.info(f"步骤 2/2: Setting Binding 已存在 - Preview 通道已配置: {filename}")
 
-            return JSONResponse(content={
+            return {
                 "success": True,
                 "filename": filename,
                 "preview": True,
-                "message": "Preview 通道配置已存在，已将 preview 属性设置为 true"
-            })
-        else:
-            # 步骤 2 失败
-            error_text = binding_response.text if hasattr(binding_response, 'text') else ""
-            log.error(f"步骤 2/2 失败: {filename} - Status: {binding_status}, Error: {error_text}")
-            if "代理异常" in error_text:
-                await record_panel_proxy_error(storage_adapter, filename, mode, error_text)
+                "message": "Preview 通道配置已存在，已将 preview 属性设置为 true",
+                "status_code": 200,
+            }
 
-            return JSONResponse(
-                status_code=binding_status,
-                content={
-                    "success": False,
-                    "filename": filename,
-                    "preview": False,
-                    "message": f"创建 Setting Binding 失败: HTTP {binding_status}",
-                    "error": error_text,
-                    "step": "create_binding"
-                }
-            )
+        # 步骤 2 失败
+        error_text = binding_response.text if hasattr(binding_response, 'text') else ""
+        log.error(f"步骤 2/2 失败: {filename} - Status: {binding_status}, Error: {error_text}")
+        if "代理异常" in error_text:
+            await record_panel_proxy_error(storage_adapter, filename, mode, error_text)
+
+        return {
+            "success": False,
+            "filename": filename,
+            "preview": False,
+            "message": f"创建 Setting Binding 失败: HTTP {binding_status}",
+            "error": error_text,
+            "step": "create_binding",
+            "status_code": binding_status,
+        }
 
     except HTTPException:
         raise
@@ -1533,17 +1526,28 @@ async def configure_preview_channel(
             storage_adapter = await get_storage_adapter()
             error_message = format_request_exception_message("配置失败", e)
             await record_panel_proxy_error(storage_adapter, filename, mode, error_message)
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False,
-                    "filename": filename,
-                    "preview": False,
-                    "message": "代理异常",
-                    "error": error_message,
-                }
-            )
+            return {
+                "success": False,
+                "filename": filename,
+                "preview": False,
+                "message": "代理异常",
+                "error": error_message,
+                "status_code": 500,
+            }
         raise HTTPException(status_code=500, detail=f"配置失败: {str(e)}")
+
+
+@router.post("/configure-preview/{filename}")
+async def configure_preview_channel(
+    filename: str,
+    token: str = Depends(verify_panel_token),
+    mode: str = "geminicli"
+):
+    result = await configure_preview_channel_common(filename, mode=mode)
+    status_code = int(result.get("status_code") or (200 if result.get("success") else 400))
+    payload = result.copy()
+    payload.pop("status_code", None)
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.post("/test/{filename}")

@@ -321,7 +321,11 @@ async def generate_proxy_pool_url(
         if not (generator_url.startswith("http://") or generator_url.startswith("https://")):
             raise HTTPException(status_code=400, detail="凭证代理生成链接必须以 http:// 或 https:// 开头")
 
-        generated_url = await generate_proxy_url_from_generator(generator_url)
+        scheme = str(request.scheme or "socks5").strip().lower()
+        if scheme not in config.SUPPORTED_PROXY_SCHEMES:
+            raise HTTPException(status_code=400, detail="代理协议必须是 http、https 或 socks5")
+
+        generated_url = await generate_proxy_url_from_generator(generator_url, scheme=scheme)
         if not generated_url:
             raise HTTPException(status_code=502, detail="生成代理URL失败，请检查生成链接返回内容")
 

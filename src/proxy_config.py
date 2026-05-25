@@ -69,10 +69,14 @@ async def _fetch_generated_proxy_suffix(generator_url: str) -> Optional[str]:
         return None
 
 
-async def generate_proxy_url_from_generator(generator_url: str) -> Optional[str]:
-    """Generate a socks5 proxy URL using the configured generator."""
+async def generate_proxy_url_from_generator(generator_url: str, scheme: str = "socks5") -> Optional[str]:
+    """Generate a proxy URL using the configured generator."""
     generator_url = str(generator_url or "").strip()
+    scheme = str(scheme or "socks5").strip().lower()
     if not generator_url:
+        return None
+    if scheme not in app_config.SUPPORTED_PROXY_SCHEMES:
+        log.warning(f"[PROXY] 不支持的代理协议: {scheme}")
         return None
 
     generated_suffix = await _fetch_generated_proxy_suffix(generator_url)
@@ -80,7 +84,9 @@ async def generate_proxy_url_from_generator(generator_url: str) -> Optional[str]
         return None
 
     try:
-        return validate_proxy_url(f"socks5://{generated_suffix}")
+        if "://" in generated_suffix:
+            generated_suffix = generated_suffix.split("://", 1)[1]
+        return validate_proxy_url(f"{scheme}://{generated_suffix}")
     except ValueError as e:
         log.warning(f"[PROXY] 代理生成接口返回无效代理地址: {e}")
         return None

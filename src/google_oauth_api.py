@@ -204,7 +204,11 @@ class Flow:
         params.update(kwargs)
         return f"{self.auth_endpoint}?{urlencode(params)}"
 
-    async def exchange_code(self, code: str) -> Credentials:
+    async def exchange_code(
+        self,
+        code: str,
+        proxy_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Credentials:
         """用授权码换取token"""
         data = {
             "client_id": self.client_id,
@@ -218,7 +222,10 @@ class Flow:
             oauth_base_url = await get_oauth_proxy_url()
             token_url = f"{oauth_base_url.rstrip('/')}/token"
             response = await post_async(
-                token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}
+                token_url,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                **(proxy_kwargs or {}),
             )
             response.raise_for_status()
 

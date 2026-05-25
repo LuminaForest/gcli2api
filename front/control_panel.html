@@ -1533,7 +1533,8 @@
                 <div class="tab-slider"></div>
                 <button class="tab active" onclick="switchTab('oauth')">OAuth认证</button>
                 <button class="tab" onclick="switchTab('antigravity')">Antigravity认证</button>
-                <button class="tab" onclick="switchTab('upload')">批量上传</button>
+                <!-- <button class="tab" onclick="switchTab('upload')">批量上传</button> -->
+                <button class="tab" onclick="switchTab('batchGenerate')">批量生成</button>
                 <button class="tab" onclick="switchTab('manage')">GCLI凭证管理</button>
                 <button class="tab" onclick="switchTab('antigravity-manage')">Antigravity凭证管理</button>
                 <button class="tab" onclick="switchTab('config')">配置管理</button>
@@ -1817,6 +1818,66 @@
                                 <div class="progress-fill" id="antigravityProgressFill" style="width: 0%"></div>
                             </div>
                             <p id="antigravityProgressText">0%</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 批量生成标签页 -->
+            <div id="batchGenerateTab" class="tab-content">
+                <h3>批量生成GCLI凭证文件</h3>
+
+                <div style="margin-bottom: 30px; padding: 20px; border: 2px solid #e1e4e8; border-radius: 8px; background: #f8f9fa;">
+                    <h4 style="margin-top: 0; color: #007bff; border-bottom: 2px solid #007bff; padding-bottom: 10px;">
+                        代理设置</h4>
+                    <div style="display: flex; gap: 12px; align-items: stretch; flex-wrap: wrap;">
+                        <div style="flex: 1; min-width: 260px; padding: 12px; border: 1px solid #d0d7de; border-radius: 6px; background: #fff;">
+                            <div style="color: #666; font-size: 13px; margin-bottom: 6px;">代理地址</div>
+                            <div id="batchGenerateProxyUrl" style="font-family: monospace; font-size: 13px; color: #333; word-break: break-all;">
+                                未生成代理地址
+                            </div>
+                        </div>
+                        <button type="button" class="btn" id="batchGenerateSwitchProxyBtn"
+                            onclick="window.BatchGenerate.switchProxy()" style="white-space: nowrap;">
+                            切换代理地址
+                        </button>
+                    </div>
+                </div>
+
+                <div style="padding: 20px; border: 2px solid #e1e4e8; border-radius: 8px; background: #f8f9fa;">
+                    <h4 style="margin-top: 0; color: #28a745; border-bottom: 2px solid #28a745; padding-bottom: 10px;">
+                        上传账号文件</h4>
+                    <div class="upload-area" id="batchGenerateUploadArea"
+                        onclick="document.getElementById('batchGenerateFileInput').click()"
+                        ondragover="window.BatchGenerate.handleDragOver(event)"
+                        ondragleave="window.BatchGenerate.handleDragLeave(event)"
+                        ondrop="window.BatchGenerate.handleFileDrop(event)">
+                        <p>点击选择文件或拖拽文件到此区域</p>
+                        <p style="color: #666; font-size: 14px;">只支持上传一个 .txt 文件</p>
+                        <p style="color: #888; font-size: 12px;">每行格式：谷歌账号|密码|2fa密钥|手机号|手机号验证码获取链接</p>
+                    </div>
+
+                    <input type="file" id="batchGenerateFileInput" accept=".txt,text/plain" style="display: none;"
+                        onchange="window.BatchGenerate.handleFileSelect(event)" />
+
+                    <div id="batchGenerateFileListSection" class="hidden">
+                        <h4>选择的文件：</h4>
+                        <div class="file-list" id="batchGenerateFileList"></div>
+                    </div>
+
+                    <button type="button" class="btn" id="batchGenerateStartBtn"
+                        onclick="window.BatchGenerate.start()" style="margin-top: 16px;">
+                        开始生成
+                    </button>
+                    <div id="batchGenerateAccountStatus"
+                        style="display: none; margin-top: 10px; padding: 10px 12px; border-radius: 6px; border: 1px solid #d0d7de; background: #fff; font-size: 13px;">
+                    </div>
+
+                    <div style="margin-top: 18px;">
+                        <h4>生成日志</h4>
+                        <div id="batchGenerateLogContent"
+                            style="background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 12px; min-height: 90px; max-height: 220px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word;">
+                            等待开始生成...
                         </div>
                     </div>
                 </div>
@@ -2516,6 +2577,7 @@
 
     <!-- 引入公共JavaScript模块 -->
     <script src="./front/common.js?v=proxy-pool-ui-8"></script>
+    <script src="./front/batch_generate.js?v=batch-generate-4"></script>
 
 </body>
 

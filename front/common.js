@@ -1523,6 +1523,7 @@ function triggerTabDataLoad(tabName) {
     if (tabName === 'antigravity-manage') AppState.antigravityCreds.refresh();
     if (tabName === 'config') loadConfig();
     if (tabName === 'proxyPool') loadProxyPoolConfig();
+    if (tabName === 'batchGenerate' && window.BatchGenerate) window.BatchGenerate.load();
     if (tabName === 'logs') connectWebSocket();
 }
 

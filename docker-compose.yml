@@ -35,7 +35,7 @@ services:
       # Server configuration
       - PORT=${PORT:-7861}
       - HOST=${HOST:-0.0.0.0}
-      - WORKERS=${WORKERS:-4}
+      - WORKERS=${WORKERS:-3}
 
       # Optional: Google credentials from environment
       # - GOOGLE_CREDENTIALS=${GOOGLE_CREDENTIALS}
