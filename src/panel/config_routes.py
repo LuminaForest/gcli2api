@@ -2,13 +2,16 @@
 配置路由模块 - 处理 /config/* 相关的HTTP请求
 """
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 import config
 from log import log
 from src.keeplive import keepalive_service
-from src.models import ConfigSaveRequest
+from src.models import ConfigSaveRequest, ProxyPoolGenerateRequest
+from src.proxy_config import generate_proxy_url_from_generator
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token
 from .utils import get_env_locked_keys
@@ -16,6 +19,40 @@ from .utils import get_env_locked_keys
 
 # 创建路由器
 router = APIRouter(prefix="/config", tags=["config"])
+
+
+async def _get_proxy_bindings(storage_adapter) -> dict[str, list[dict[str, str]]]:
+    """Return credential bindings grouped by proxy pool name."""
+    bindings: dict[str, list[dict[str, str]]] = {}
+    for mode in ("geminicli", "antigravity"):
+        try:
+            states = await storage_adapter.get_all_credential_states(mode=mode)
+        except Exception as e:
+            log.warning(f"读取{mode}代理绑定状态失败: {e}")
+            continue
+
+        for filename, state in states.items():
+            proxy_name = str((state or {}).get("proxy_name") or "").strip()
+            if not proxy_name:
+                continue
+            bindings.setdefault(proxy_name, []).append({
+                "mode": mode,
+                "filename": os.path.basename(filename),
+            })
+
+    return bindings
+
+
+def _sort_proxy_pool(proxy_pool: list[dict[str, str]]) -> list[dict[str, str]]:
+    def sort_key(item: dict[str, str]):
+        name = str(item.get("name", ""))
+        if name.startswith("proxy_"):
+            suffix = name.removeprefix("proxy_")
+            if suffix.isdigit():
+                return (0, int(suffix), name)
+        return (1, 0, name)
+
+    return sorted(proxy_pool, key=sort_key)
 
 
 @router.get("/get")
@@ -75,6 +112,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 从存储系统读取配置
         storage_adapter = await get_storage_adapter()
         storage_config = await storage_adapter.get_all_config()
+        proxy_bindings = await _get_proxy_bindings(storage_adapter)
 
         # 获取环境变量锁定的配置键
         env_locked_keys = get_env_locked_keys()
@@ -84,7 +122,8 @@ async def get_config(token: str = Depends(verify_panel_token)):
             if key not in env_locked_keys:
                 current_config[key] = value
 
-        current_config["proxy_pool"] = await config.get_proxy_pool_config()
+        current_config["proxy_bindings"] = proxy_bindings
+        current_config["proxy_pool"] = _sort_proxy_pool(await config.get_proxy_pool_config())
 
         return JSONResponse(content={"config": current_config, "env_locked": list(env_locked_keys)})
 
@@ -138,7 +177,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
 
         if "proxy_pool" in new_config:
             try:
-                new_config["proxy_pool"] = config.normalize_proxy_pool(new_config["proxy_pool"])
+                new_config["proxy_pool"] = _sort_proxy_pool(config.normalize_proxy_pool(new_config["proxy_pool"]))
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
@@ -200,11 +239,26 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if not isinstance(new_config["password"], str):
                 raise HTTPException(status_code=400, detail="访问密码必须是字符串")
 
+        # 直接使用存储适配器保存配置
+        storage_adapter = await get_storage_adapter()
+
+        if "proxy_pool" in new_config:
+            old_proxy_pool = await config.get_proxy_pool_config()
+            old_names = {item["name"] for item in old_proxy_pool}
+            new_names = {item["name"] for item in new_config["proxy_pool"]}
+            removed_names = old_names - new_names
+            if removed_names:
+                proxy_bindings = await _get_proxy_bindings(storage_adapter)
+                blocked_names = sorted(name for name in removed_names if proxy_bindings.get(name))
+                if blocked_names:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"代理已被凭证绑定，无法删除: {', '.join(blocked_names)}"
+                    )
+
         # 获取环境变量锁定的配置键
         env_locked_keys = get_env_locked_keys()
 
-        # 直接使用存储适配器保存配置
-        storage_adapter = await get_storage_adapter()
         failed_keys = []
         for key, value in new_config.items():
             if key not in env_locked_keys:
@@ -251,4 +305,30 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         raise
     except Exception as e:
         log.error(f"保存配置失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/proxy-pool/generate")
+async def generate_proxy_pool_url(
+    request: ProxyPoolGenerateRequest,
+    token: str = Depends(verify_panel_token)
+):
+    """调用凭证代理生成链接，生成一个新的代理池 URL。"""
+    try:
+        generator_url = str(request.generator_url or await config.get_credential_proxy_generator_url() or "").strip()
+        if not generator_url:
+            raise HTTPException(status_code=400, detail="请先填写凭证代理生成链接")
+        if not (generator_url.startswith("http://") or generator_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="凭证代理生成链接必须以 http:// 或 https:// 开头")
+
+        generated_url = await generate_proxy_url_from_generator(generator_url)
+        if not generated_url:
+            raise HTTPException(status_code=502, detail="生成代理URL失败，请检查生成链接返回内容")
+
+        return JSONResponse(content={"url": generated_url})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"生成代理池URL失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))

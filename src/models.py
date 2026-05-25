@@ -381,5 +381,9 @@ class CredProxyBindRequest(BaseModel):
     proxy_name: Optional[str] = None  # 空值表示解绑
 
 
+class ProxyPoolGenerateRequest(BaseModel):
+    generator_url: Optional[str] = None
+
+
 class ConfigSaveRequest(BaseModel):
     config: dict

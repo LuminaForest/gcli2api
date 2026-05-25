@@ -69,6 +69,23 @@ async def _fetch_generated_proxy_suffix(generator_url: str) -> Optional[str]:
         return None
 
 
+async def generate_proxy_url_from_generator(generator_url: str) -> Optional[str]:
+    """Generate a socks5 proxy URL using the configured generator."""
+    generator_url = str(generator_url or "").strip()
+    if not generator_url:
+        return None
+
+    generated_suffix = await _fetch_generated_proxy_suffix(generator_url)
+    if not generated_suffix:
+        return None
+
+    try:
+        return validate_proxy_url(f"socks5://{generated_suffix}")
+    except ValueError as e:
+        log.warning(f"[PROXY] 代理生成接口返回无效代理地址: {e}")
+        return None
+
+
 async def refresh_bound_proxy_url_once(request_kwargs: Dict[str, Any], exc: Exception) -> Optional[str]:
     """Replace a bound credential proxy URL once after a proxy failure."""
     if request_kwargs.get("_proxy_refresh_attempted"):

@@ -676,7 +676,287 @@ function getAuthHeaders() {
 }
 
 function getProxyPool() {
-    return Array.isArray(AppState.currentConfig.proxy_pool) ? AppState.currentConfig.proxy_pool : [];
+    return sortProxyPoolItems(Array.isArray(AppState.currentConfig.proxy_pool) ? AppState.currentConfig.proxy_pool : []);
+}
+
+function setProxyPool(pool) {
+    AppState.currentConfig.proxy_pool = sortProxyPoolItems(pool);
+}
+
+function getProxyPoolBindings() {
+    const bindings = AppState.currentConfig.proxy_bindings;
+    return bindings && typeof bindings === 'object' && !Array.isArray(bindings) ? bindings : {};
+}
+
+function addProxyBinding(bindings, proxyName, mode, filename) {
+    proxyName = String(proxyName || '').trim();
+    filename = String(filename || '').trim();
+    if (!proxyName || !filename) return;
+
+    const list = Array.isArray(bindings[proxyName]) ? bindings[proxyName] : [];
+    if (!list.some(item => item.mode === mode && item.filename === filename)) {
+        list.push({ mode, filename });
+    }
+    bindings[proxyName] = list;
+}
+
+async function refreshProxyPoolBindingsFromCredentialStatus() {
+    const bindings = {};
+    Object.entries(getProxyPoolBindings()).forEach(([proxyName, items]) => {
+        if (!Array.isArray(items)) return;
+        items.forEach(item => addProxyBinding(bindings, proxyName, item.mode || 'unknown', item.filename || '-'));
+    });
+
+    for (const mode of ['geminicli', 'antigravity']) {
+        let offset = 0;
+        const limit = 1000;
+        let guard = 0;
+
+        while (guard < 50) {
+            guard += 1;
+            try {
+                const response = await fetch(
+                    `./creds/status?offset=${offset}&limit=${limit}&status_filter=all&error_code_filter=all&cooldown_filter=all&preview_filter=all&tier_filter=all&mode=${mode}`,
+                    { headers: getAuthHeaders() }
+                );
+                const data = await response.json();
+                if (!response.ok) break;
+
+                (data.items || []).forEach(item => {
+                    addProxyBinding(bindings, item.proxy_name, mode, item.filename);
+                });
+
+                if (!data.has_more) break;
+                offset += data.limit || limit;
+            } catch {
+                break;
+            }
+        }
+    }
+
+    AppState.currentConfig.proxy_bindings = bindings;
+}
+
+function getProxyNameSequence(name) {
+    const match = /^proxy_(\d+)$/.exec(String(name || ''));
+    return match ? parseInt(match[1], 10) : null;
+}
+
+function sortProxyPoolItems(pool) {
+    return [...pool].sort((a, b) => {
+        const seqA = getProxyNameSequence(a?.name);
+        const seqB = getProxyNameSequence(b?.name);
+
+        if (seqA !== null && seqB !== null) return seqA - seqB;
+        if (seqA !== null) return -1;
+        if (seqB !== null) return 1;
+        return String(a?.name || '').localeCompare(String(b?.name || ''));
+    });
+}
+
+function getNextProxyPoolName(pool = getProxyPool()) {
+    const maxSeq = pool.reduce((max, item) => {
+        const seq = getProxyNameSequence(item.name);
+        return seq === null ? max : Math.max(max, seq);
+    }, 0);
+    return `proxy_${maxSeq + 1}`;
+}
+
+function getProxyBindings(proxyName) {
+    const bindings = getProxyPoolBindings()[proxyName];
+    return Array.isArray(bindings) ? bindings : [];
+}
+
+function getProxyBindingTitle(bindings) {
+    if (!bindings.length) return '未被凭证绑定';
+
+    const shown = bindings.slice(0, 8)
+        .map(item => `${item.mode || 'unknown'}: ${item.filename || '-'}`)
+        .join('\n');
+    const more = bindings.length > 8 ? `\n还有 ${bindings.length - 8} 个绑定` : '';
+    return `已绑定凭证:\n${shown}${more}`;
+}
+
+function readProxyPoolFromEditor() {
+    return getProxyPool();
+}
+
+function renderProxyPoolEditor() {
+    const list = document.getElementById('proxyPoolList');
+    if (!list) return;
+
+    const pool = getProxyPool();
+    if (!pool.length) {
+        list.innerHTML = '<div class="proxy-pool-empty">暂无凭证代理，点击创建代理生成新的代理池条目。</div>';
+    } else {
+        list.innerHTML = pool.map(item => {
+            const name = String(item.name || '');
+            const url = String(item.url || '');
+            const bindings = getProxyBindings(name);
+            const bound = bindings.length > 0;
+            const badgeClass = bound ? 'bound' : 'unbound';
+            const badgeText = bound ? `已绑定 ${bindings.length}` : '未绑定';
+            const bindingTitle = escapeHtml(getProxyBindingTitle(bindings));
+            const deleteTitle = bound ? '该代理已被凭证绑定，无法删除' : '删除该代理';
+
+            return `
+                <div class="proxy-pool-item">
+                    <div class="proxy-pool-name">
+                        <span title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+                        <span class="proxy-pool-badge ${badgeClass}" title="${bindingTitle}">${badgeText}</span>
+                    </div>
+                    <div class="proxy-pool-url" title="${escapeHtml(url)}">${escapeHtml(url)}</div>
+                    <button type="button" class="proxy-pool-delete" data-proxy-delete-name="${escapeHtml(name)}"
+                        title="${escapeHtml(deleteTitle)}" ${bound ? 'disabled' : ''}>删除</button>
+                </div>
+            `;
+        }).join('');
+
+        list.querySelectorAll('[data-proxy-delete-name]').forEach(button => {
+            button.addEventListener('click', () => deleteProxyPoolItem(button.getAttribute('data-proxy-delete-name')));
+        });
+    }
+
+    const createButton = document.getElementById('createProxyPoolItem');
+    if (createButton && !createButton.dataset.bound) {
+        createButton.dataset.bound = '1';
+        createButton.addEventListener('click', createProxyPoolItem);
+    }
+}
+
+async function saveConfigPatch(config, successMessage = '') {
+    const response = await fetch('/config/save', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ config })
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.detail || data.error || '未知错误');
+    }
+
+    if (successMessage) {
+        showStatus(successMessage, 'success');
+    }
+    return data;
+}
+
+async function saveCredentialProxyGeneratorUrl() {
+    const button = document.getElementById('saveCredentialProxyGeneratorUrl');
+    const input = document.getElementById('credentialProxyGeneratorUrl');
+    const value = input?.value.trim() || '';
+    const originalText = button ? button.textContent.trim() : '';
+
+    try {
+        if (button) {
+            button.disabled = true;
+            button.textContent = '保存中...';
+        }
+
+        await saveConfigPatch(
+            { credential_proxy_generator_url: value },
+            '凭证代理生成链接已保存'
+        );
+        AppState.currentConfig.credential_proxy_generator_url = value;
+    } catch (error) {
+        showStatus(`保存凭证代理生成链接失败: ${error.message}`, 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = originalText || '保存地址';
+        }
+    }
+}
+
+async function saveProxyPoolConfig(successMessage, extraConfig = {}) {
+    const config = {
+        proxy_pool: getProxyPool(),
+        ...extraConfig
+    };
+    await saveConfigPatch(config, successMessage);
+}
+
+async function deleteProxyPoolItem(proxyName) {
+    const bindings = getProxyBindings(proxyName);
+    if (bindings.length) {
+        showStatus(`代理 ${proxyName} 已被凭证绑定，无法删除`, 'error');
+        return;
+    }
+
+    if (!confirm(`确定删除代理 ${proxyName} 吗？`)) return;
+
+    const oldPool = getProxyPool();
+    setProxyPool(oldPool.filter(item => item.name !== proxyName));
+    renderProxyPoolEditor();
+    populateProxyBindSelects();
+
+    try {
+        await saveProxyPoolConfig(`已删除并保存代理 ${proxyName}`);
+    } catch (error) {
+        setProxyPool(oldPool);
+        renderProxyPoolEditor();
+        populateProxyBindSelects();
+        showStatus(`删除代理失败: ${error.message}`, 'error');
+    }
+}
+
+async function createProxyPoolItem() {
+    const button = document.getElementById('createProxyPoolItem');
+    const generatorUrl = document.getElementById('credentialProxyGeneratorUrl')?.value.trim() || '';
+
+    if (!generatorUrl) {
+        showStatus('请先填写凭证代理生成链接', 'error');
+        return;
+    }
+
+    const pool = readProxyPoolFromEditor();
+    const name = getNextProxyPoolName(pool);
+    const originalText = button ? button.textContent.trim() : '';
+
+    try {
+        if (button) {
+            button.disabled = true;
+            button.textContent = '创建中...';
+        }
+
+        const response = await fetch('/config/proxy-pool/generate', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                generator_url: generatorUrl
+            })
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+            showStatus(`创建代理失败: ${data.detail || data.error || '未知错误'}`, 'error');
+            return;
+        }
+
+        setProxyPool([...pool, { name, url: data.url }]);
+        renderProxyPoolEditor();
+        populateProxyBindSelects();
+        try {
+            await saveProxyPoolConfig(
+                `已创建并保存代理 ${name}`,
+                { credential_proxy_generator_url: generatorUrl }
+            );
+            AppState.currentConfig.credential_proxy_generator_url = generatorUrl;
+        } catch (saveError) {
+            setProxyPool(pool);
+            renderProxyPoolEditor();
+            populateProxyBindSelects();
+            throw saveError;
+        }
+    } catch (error) {
+        showStatus(`创建代理失败: ${error.message}`, 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = originalText || '创建代理';
+        }
+    }
 }
 
 function escapeHtml(value) {
@@ -1216,6 +1496,7 @@ function triggerTabDataLoad(tabName) {
     if (tabName === 'manage') AppState.creds.refresh();
     if (tabName === 'antigravity-manage') AppState.antigravityCreds.refresh();
     if (tabName === 'config') loadConfig();
+    if (tabName === 'proxyPool') loadProxyPoolConfig();
     if (tabName === 'logs') connectWebSocket();
 }
 
@@ -2906,6 +3187,7 @@ async function loadConfig() {
             AppState.currentConfig = data.config;
             AppState.envLockedFields = new Set(data.env_locked || []);
             AppState.proxyPoolLoaded = true;
+            await refreshProxyPoolBindingsFromCredentialStatus();
 
             populateConfigForm();
             populateProxyBindSelects();
@@ -2921,6 +3203,37 @@ async function loadConfig() {
     }
 }
 
+async function loadProxyPoolConfig() {
+    const loading = document.getElementById('proxyPoolLoading');
+    const form = document.getElementById('proxyPoolForm');
+
+    try {
+        if (loading) loading.style.display = 'block';
+        if (form) form.classList.add('hidden');
+
+        const response = await fetch('./config/get', { headers: getAuthHeaders() });
+        const data = await response.json();
+
+        if (response.ok) {
+            AppState.currentConfig = data.config;
+            AppState.envLockedFields = new Set(data.env_locked || []);
+            AppState.proxyPoolLoaded = true;
+            await refreshProxyPoolBindingsFromCredentialStatus();
+
+            populateProxyPoolForm();
+            populateProxyBindSelects();
+            if (form) form.classList.remove('hidden');
+            showStatus('代理池加载成功', 'success');
+        } else {
+            showStatus(`加载代理池失败: ${data.detail || data.error || '未知错误'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`网络错误: ${error.message}`, 'error');
+    } finally {
+        if (loading) loading.style.display = 'none';
+    }
+}
+
 function populateConfigForm() {
     const c = AppState.currentConfig;
 
@@ -2931,8 +3244,6 @@ function populateConfigForm() {
     setConfigField('configPassword', c.password || 'pwd');
     setConfigField('credentialsDir', c.credentials_dir || '');
     setConfigField('proxy', c.proxy || '');
-    setConfigField('proxyPool', JSON.stringify(c.proxy_pool || [], null, 2));
-    setConfigField('credentialProxyGeneratorUrl', c.credential_proxy_generator_url || '');
     setConfigField('codeAssistEndpoint', c.code_assist_endpoint || '');
     setConfigField('oauthProxyUrl', c.oauth_proxy_url || '');
     setConfigField('googleapisProxyUrl', c.googleapis_proxy_url || '');
@@ -2958,6 +3269,13 @@ function populateConfigForm() {
     setConfigField('keepaliveInterval', c.keepalive_interval || 60);
 }
 
+function populateProxyPoolForm() {
+    const c = AppState.currentConfig;
+    setProxyPool(c.proxy_pool || []);
+    renderProxyPoolEditor();
+    setConfigField('credentialProxyGeneratorUrl', c.credential_proxy_generator_url || '');
+}
+
 function setConfigField(fieldId, value) {
     const field = document.getElementById(fieldId);
     if (field) {
@@ -2979,14 +3297,6 @@ async function saveConfig() {
         const getInt = (id, def = 0) => parseInt(document.getElementById(id)?.value) || def;
         const getFloat = (id, def = 0.0) => parseFloat(document.getElementById(id)?.value) || def;
         const getChecked = (id, def = false) => document.getElementById(id)?.checked || def;
-        const parseProxyPool = () => {
-            const raw = getValue('proxyPool', '[]');
-            try {
-                return raw ? JSON.parse(raw) : [];
-            } catch {
-                throw new Error('代理池必须是有效的 JSON 数组');
-            }
-        };
 
         const config = {
             host: getValue('host', '0.0.0.0'),
@@ -2997,8 +3307,6 @@ async function saveConfig() {
             code_assist_endpoint: getValue('codeAssistEndpoint'),
             credentials_dir: getValue('credentialsDir'),
             proxy: getValue('proxy'),
-            proxy_pool: parseProxyPool(),
-            credential_proxy_generator_url: getValue('credentialProxyGeneratorUrl'),
             oauth_proxy_url: getValue('oauthProxyUrl'),
             googleapis_proxy_url: getValue('googleapisProxyUrl'),
             resource_manager_api_url: getValue('resourceManagerApiUrl'),

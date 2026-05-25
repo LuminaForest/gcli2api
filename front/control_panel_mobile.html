@@ -105,6 +105,121 @@
             background-color: #c82333;
         }
 
+        .proxy-generator-row {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+        }
+
+        .proxy-generator-save-btn {
+            width: 100%;
+            padding: 10px 12px;
+            margin-bottom: 0;
+            font-size: 14px;
+        }
+
+        .proxy-pool-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+
+        .proxy-pool-header label {
+            margin-bottom: 0;
+        }
+
+        .proxy-pool-create-btn {
+            width: auto;
+            padding: 9px 12px;
+            margin-bottom: 0;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+
+        .proxy-pool-list {
+            display: grid;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .proxy-pool-empty {
+            padding: 12px;
+            border: 1px dashed #cfd7df;
+            border-radius: 8px;
+            color: #666;
+            background: #fff;
+            font-size: 13px;
+        }
+
+        .proxy-pool-item {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+            padding: 10px;
+            border: 1px solid #dfe3e8;
+            border-radius: 8px;
+            background: #fff;
+        }
+
+        .proxy-pool-name {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            min-width: 0;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .proxy-pool-badge {
+            padding: 2px 7px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .proxy-pool-badge.bound {
+            background: #e8f0fe;
+            color: #1a73e8;
+        }
+
+        .proxy-pool-badge.unbound {
+            background: #eef2f3;
+            color: #546e7a;
+        }
+
+        .proxy-pool-url {
+            min-width: 0;
+            padding: 10px 12px;
+            border: 1px solid #dfe3e8;
+            border-radius: 6px;
+            background: #f8f9fa;
+            color: #333;
+            font-size: 13px;
+            line-height: 1.4;
+            margin-bottom: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .proxy-pool-delete {
+            border: none;
+            border-radius: 6px;
+            background: #dc3545;
+            color: #fff;
+            padding: 10px 12px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .proxy-pool-delete:disabled {
+            background: #cfd7df;
+            color: #607d8b;
+            cursor: not-allowed;
+        }
+
         /* 移动端优化的标签页 */
         .tabs {
             display: flex;
@@ -1045,6 +1160,7 @@
                 <button class="tab" onclick="switchTab('manage')">GCLI凭证</button>
                 <button class="tab" onclick="switchTab('antigravity-manage')">AG凭证</button>
                 <button class="tab" onclick="switchTab('config')">配置管理</button>
+                <button class="tab" onclick="switchTab('proxyPool')">代理池</button>
                 <button class="tab" onclick="switchTab('logs')">实时日志</button>
             </div>
 
@@ -1777,22 +1893,6 @@
                                 <small
                                     style="display: block; color: #666; font-size: 12px; margin-top: 5px;">HTTP/HTTPS/SOCKS5Endpoint，留空表示不使用代理</small>
                             </div>
-
-                            <div class="form-group">
-                                <label for="proxyPool">凭证代理池:</label>
-                                <textarea id="proxyPool" rows="6"
-                                    placeholder='[{"name":"hk-1","url":"http://proxy:7890"}]'></textarea>
-                                <small
-                                    style="display: block; color: #666; font-size: 12px; margin-top: 5px;">JSON数组。url格式示例：http://user:password@host:port，也支持 http://host:port:user:password；未绑定则继承全局代理。</small>
-                            </div>
-
-                            <div class="form-group">
-                                <label for="credentialProxyGeneratorUrl">凭证代理生成链接:</label>
-                                <input type="text" id="credentialProxyGeneratorUrl"
-                                    placeholder="例如: https://webipapi.cliproxy.com/api/getIpInfo" />
-                                <small
-                                    style="display: block; color: #666; font-size: 12px; margin-top: 5px;">绑定代理池中的代理异常时，调用该链接获取新的代理URL，替换对应代理池条目并只重试一次；留空则禁用。</small>
-                            </div>
                         </div>
 
                         <div class="card">
@@ -2034,6 +2134,50 @@
                 </div>
             </div>
 
+            <div id="proxyPoolTab" class="tab-content">
+                <h3>代理池管理</h3>
+                <p>管理凭证专属代理池和代理生成链接</p>
+
+                <div style="display: flex; gap: 8px; margin: 15px 0; flex-wrap: wrap;">
+                    <button class="btn btn-small" onclick="loadProxyPoolConfig()"
+                        style="background-color: #17a2b8;">刷新代理池</button>
+                </div>
+
+                <div id="proxyPoolSection">
+                    <div class="loading" id="proxyPoolLoading">正在加载代理池...</div>
+                    <div id="proxyPoolForm" class="hidden">
+                        <div class="card">
+                            <h4 style="margin-top: 0; margin-bottom: 15px;">凭证代理生成链接</h4>
+
+                            <div class="form-group">
+                                <label for="credentialProxyGeneratorUrl">凭证代理生成链接:</label>
+                                <div class="proxy-generator-row">
+                                    <input type="text" id="credentialProxyGeneratorUrl"
+                                        placeholder="例如: https://webipapi.cliproxy.com/api/getIpInfo" />
+                                    <button type="button" id="saveCredentialProxyGeneratorUrl"
+                                        class="btn proxy-generator-save-btn"
+                                        onclick="saveCredentialProxyGeneratorUrl()">保存地址</button>
+                                </div>
+                                <small
+                                    style="display: block; color: #666; font-size: 12px; margin-top: 5px;">创建代理或绑定代理异常刷新时使用该链接获取新的代理地址；留空则禁用。</small>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="proxy-pool-header">
+                                <h4 style="margin: 0;">凭证代理池</h4>
+                                <button type="button" id="createProxyPoolItem" class="btn proxy-pool-create-btn">
+                                    创建代理
+                                </button>
+                            </div>
+                            <div id="proxyPoolList" class="proxy-pool-list"></div>
+                            <small
+                                style="display: block; color: #666; font-size: 12px; margin-top: 5px;">凭证可绑定 name；创建后自动保存；已绑定的代理不能删除。</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div id="logsTab" class="tab-content">
                 <h3>实时日志</h3>
                 <p>查看系统实时日志输出，支持日志筛选和自动滚动</p>
@@ -2082,7 +2226,7 @@
     </div>
 
     <!-- 引入公共JavaScript模块 -->
-    <script src="./front/common.js?v=proxy-generator-3"></script>
+    <script src="./front/common.js?v=proxy-pool-ui-6"></script>
 </body>
 
 </html>
