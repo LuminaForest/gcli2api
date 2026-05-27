@@ -260,10 +260,12 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtnNames = ['Enable', 'Disable', 'Delete', 'Verify', 'Preview', 'BindProxy'];
+            const batchBtnNames = ['Enable', 'Disable', 'Delete', 'Verify'];
             if (this.type === 'antigravity') {
                 batchBtnNames.push('EnableCredit');
                 batchBtnNames.push('DisableCredit');
+            } else {
+                batchBtnNames.push('Preview');
             }
             const batchBtns = batchBtnNames.map(action =>
                 document.getElementById(this.getElementId(`Batch${action}Btn`))
@@ -1018,8 +1020,7 @@ async function ensureProxyPoolLoaded() {
 function populateProxyBindSelects() {
     const pool = getProxyPool();
     const selects = [
-        document.getElementById('batchProxySelect'),
-        document.getElementById('antigravityBatchProxySelect')
+        document.getElementById('batchProxySelect')
     ].filter(Boolean);
 
     selects.forEach(select => {
@@ -1970,9 +1971,6 @@ function toggleSelectAllAntigravity() {
     AppState.antigravityCreds.updateBatchControls();
 }
 function batchAntigravityAction(action) { AppState.antigravityCreds.batchAction(action); }
-function batchAntigravityBindProxy() {
-    AppState.antigravityCreds.batchBindProxy(document.getElementById('antigravityBatchProxySelect')?.value || '');
-}
 function downloadAntigravityCred(filename) {
     fetch(`./creds/download/${filename}?mode=antigravity`, { headers: getAuthHeaders() })
         .then(r => r.ok ? r.blob() : Promise.reject())
