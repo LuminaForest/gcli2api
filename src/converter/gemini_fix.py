@@ -464,7 +464,12 @@ async def normalize_gemini_request(
     # ========== 公共处理 ==========
 
     # 1. 安全设置覆盖
-    if "lite" in model.lower():
+    if mode == "antigravity":
+        # Antigravity 的 generateContent 内部接口会拒绝扩展安全类别，
+        # 尤其是图片/JAILBREAK 相关项。这里不再强制注入默认值，
+        # 避免公开 /antigravity/v1/* 路由因 INVALID_ARGUMENT 直接失败。
+        result.pop("safety_settings", None)
+    elif "lite" in model.lower():
         result["safetySettings"] = LITE_SAFETY_SETTINGS
     else:
         result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
