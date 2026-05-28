@@ -1045,6 +1045,7 @@ def _page_has_two_step_verification_prompt(page) -> bool:
             "2fa",
             "choose how you want to sign in",
             "tap yes on your phone or tablet",
+            "open the gmail app on",
             "google authenticator",
             "authenticator app",
             "两步验证",
@@ -1057,11 +1058,102 @@ def _page_has_two_step_verification_prompt(page) -> bool:
     )
 
 
+def _click_try_another_way_for_gmail_app_prompt(
+    page,
+    progress_logger: ProgressLogger | None = None,
+) -> bool:
+    try:
+        page_text = page.locator("body").inner_text(timeout=3000).lower()
+    except Exception:
+        page_text = ""
+    if "open the gmail app on" not in page_text:
+        return False
+
+    selectors = [
+        "button:has-text('Try another way')",
+        "div[role='button']:has-text('Try another way')",
+        "[role='link']:has-text('Try another way')",
+        "a:has-text('Try another way')",
+        "[tabindex='0']:has-text('Try another way')",
+        "text=Try another way",
+        "button:has-text('尝试其他方式')",
+        "div[role='button']:has-text('尝试其他方式')",
+        "button:has-text('試試其他方式')",
+        "div[role='button']:has-text('試試其他方式')",
+    ]
+    clicked_selector = _click_first_visible(page, selectors, visible_timeout=300, click_timeout=1200)
+    if clicked_selector:
+        _emit_progress(
+            f"检测到 Open the Gmail app on 页面，已点击 Try another way: {clicked_selector}",
+            progress_logger=progress_logger,
+        )
+        return True
+
+    try:
+        clicked_text = page.evaluate(
+            """() => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return Boolean(rect.width && rect.height) &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none';
+                };
+                const interactive = Array.from(document.querySelectorAll(
+                    "button, [role='button'], [role='link'], a, [jscontroller][jsaction], [tabindex='0']"
+                ));
+                for (const el of interactive) {
+                    if (!visible(el)) continue;
+                    const text = normalize(
+                        el.innerText ||
+                        el.textContent ||
+                        el.getAttribute('aria-label') ||
+                        el.getAttribute('title')
+                    );
+                    const lowerText = text.toLowerCase();
+                    if (
+                        lowerText.includes('try another way') ||
+                        text.includes('尝试其他方式') ||
+                        text.includes('試試其他方式')
+                    ) {
+                        el.scrollIntoView({ block: 'center', inline: 'center' });
+                        el.click();
+                        return text;
+                    }
+                }
+                return '';
+            }"""
+        )
+    except Exception:
+        clicked_text = ""
+
+    if clicked_text:
+        _emit_progress(
+            f"检测到 Open the Gmail app on 页面，已点击 Try another way: {clicked_text}",
+            progress_logger=progress_logger,
+        )
+        return True
+
+    _emit_progress(
+        "检测到 Open the Gmail app on 页面，但未找到 Try another way 按钮",
+        level="warning",
+        progress_logger=progress_logger,
+    )
+    return False
+
+
 def _click_totp_challenge_option_if_present(
     page,
     progress_logger: ProgressLogger | None = None,
 ) -> bool:
     primary_selectors = [
+        "button:has-text('Get a verification code from the')",
+        "div[role='button']:has-text('Get a verification code from the')",
+        "[role='link']:has-text('Get a verification code from the')",
+        "a:has-text('Get a verification code from the')",
+        "[tabindex='0']:has-text('Get a verification code from the')",
+        "text=Get a verification code from the",
         "button:has-text('Google Authenticator')",
         "div[role='button']:has-text('Google Authenticator')",
         "[role='link']:has-text('Google Authenticator')",
@@ -1072,7 +1164,7 @@ def _click_totp_challenge_option_if_present(
     clicked_selector = _click_first_visible(page, primary_selectors, visible_timeout=300, click_timeout=1200)
     if clicked_selector:
         _emit_progress(
-            f"2FA方式选择页已点击 Google Authenticator 入口: {clicked_selector}",
+            f"2FA方式选择页已点击验证码入口: {clicked_selector}",
             progress_logger=progress_logger,
         )
         return True
@@ -1117,6 +1209,15 @@ def _click_totp_challenge_option_if_present(
                     if (!visible(el)) continue;
                     const text = textOf(el).toLowerCase();
                     if (!text) continue;
+                    if (text.includes('get a verification code from the')) {
+                        return click(el);
+                    }
+                }
+
+                for (const el of interactive) {
+                    if (!visible(el)) continue;
+                    const text = textOf(el).toLowerCase();
+                    if (!text) continue;
                     if (text.includes('google authenticator')) {
                         return click(el);
                     }
@@ -1135,7 +1236,7 @@ def _click_totp_challenge_option_if_present(
         return True
 
     _emit_progress(
-        "2FA方式选择页未找到包含 Google Authenticator 的组件",
+        "2FA方式选择页未找到包含 Get a verification code from the 或 Google Authenticator 的组件",
         level="warning",
         progress_logger=progress_logger,
     )
@@ -3709,6 +3810,8 @@ def _submit_totp_if_needed(
                 "检测到两步验证方式选择页，正在尝试切换到 Google Authenticator 验证码输入",
                 progress_logger=progress_logger,
             )
+            if _click_try_another_way_for_gmail_app_prompt(page, progress_logger=progress_logger):
+                page.wait_for_timeout(1200)
             _click_totp_challenge_option_if_present(page, progress_logger=progress_logger)
 
         has_totp = False
