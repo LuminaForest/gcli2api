@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from log import log
 from src.auth import (
     asyncio_complete_auth_flow,
+    build_temporary_credentials_from_callback_url,
     complete_auth_flow_from_callback_url,
     create_auth_url,
     get_auth_status,
@@ -136,13 +137,31 @@ async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depend
         if not request.callback_url or not request.callback_url.startswith(("http://", "https://")):
             raise HTTPException(status_code=400, detail="请提供有效的回调URL")
 
-        # 从回调URL完成认证
-        result = await complete_auth_flow_from_callback_url(
-            request.callback_url, request.project_id, mode=request.mode
-        )
+        if request.persist_credentials is False:
+            result = await build_temporary_credentials_from_callback_url(
+                request.callback_url,
+                mode=request.mode,
+                proxy_url=request.proxy_url,
+            )
+        else:
+            result = await complete_auth_flow_from_callback_url(
+                request.callback_url,
+                request.project_id,
+                mode=request.mode,
+                proxy_url=request.proxy_url,
+            )
 
         if result["success"]:
-            # 单项目认证成功
+            if request.persist_credentials is False:
+                return JSONResponse(
+                    content={
+                        "credentials": result["credentials"],
+                        "project_id": result.get("project_id"),
+                        "subscription_tier": result.get("subscription_tier"),
+                        "mode": result.get("mode") or request.mode,
+                        "message": "从回调URL认证成功，临时凭证已返回",
+                    }
+                )
             return JSONResponse(
                 content={
                     "credentials": result["credentials"],

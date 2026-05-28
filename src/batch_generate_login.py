@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import re
 import struct
 import threading
@@ -108,7 +109,15 @@ def ensure_browser_automation_available() -> None:
     try:
         import patchright.sync_api  # noqa: F401
     except ImportError as exc:
-        raise RuntimeError("缺少 patchright 依赖，请先安装 patchright 并执行 patchright install chrome") from exc
+        raise RuntimeError("缺少 patchright 依赖，请先安装 patchright；容器内浏览器模式还需要执行 patchright install chrome") from exc
+
+
+def _batch_generate_chrome_cdp_url() -> str:
+    return str(
+        os.getenv("BATCH_GENERATE_CHROME_CDP_URL")
+        or os.getenv("CHROME_CDP_URL")
+        or ""
+    ).strip()
 
 
 def _build_2fa_url(two_fa_key: str) -> str:
@@ -371,6 +380,36 @@ def _goto_english(page, url: str, **kwargs) -> None:
     page.goto(_with_english_locale(url), **kwargs)
 
 
+def _open_oauth_auth_url(page, auth_url: str, state: str, progress_logger: ProgressLogger | None = None) -> None:
+    try:
+        _goto_english(page, auth_url, wait_until="commit", timeout=30000)
+        return
+    except Exception as exc:
+        current_url = str(getattr(page, "url", "") or "")
+        if _parse_callback_code_from_url(current_url):
+            _emit_progress(
+                f"OAuth授权页已跳转到回调地址，将直接读取地址栏URL: {exc}",
+                level="warning",
+                progress_logger=progress_logger,
+            )
+            return
+
+        _emit_progress(
+            f"OAuth授权页 commit 等待失败，将用短超时继续打开并轮询地址栏: {exc}",
+            level="warning",
+            progress_logger=progress_logger,
+        )
+
+    try:
+        _goto_english(page, auth_url, wait_until="domcontentloaded", timeout=3000)
+    except Exception as exc:
+        _emit_progress(
+            f"OAuth授权页打开等待超时或被回调页中断，将继续检查地址栏: {exc}",
+            level="warning",
+            progress_logger=progress_logger,
+        )
+
+
 def _build_batch_proxy_kwargs(proxy_url: str, request_label: str) -> dict:
     proxy_url = str(proxy_url or "").strip()
     return {
@@ -384,14 +423,90 @@ def _build_batch_proxy_kwargs(proxy_url: str, request_label: str) -> dict:
     }
 
 
-def _parse_callback_code_from_url(callback_url: str, expected_state: str) -> tuple[str, str] | None:
+def _origin_base_url() -> str:
+    return str(os.getenv("GCLI2API_BASE_URL") or "").strip().rstrip("/")
+
+
+def _origin_panel_token() -> str:
+    return str(os.getenv("GCLI2API_PANEL_TOKEN") or "").strip()
+
+
+def _use_origin_callback_api() -> bool:
+    return bool(_origin_base_url() and _origin_panel_token())
+
+
+def _origin_auth_headers() -> dict[str, str]:
+    panel_token = _origin_panel_token()
+    if not panel_token:
+        raise RuntimeError("未配置远程服务连接密码，无法将回调URL发送到远程服务")
+    return {"Authorization": f"Bearer {panel_token}"}
+
+
+def _parse_callback_code_from_url(callback_url: str, expected_state: str = "") -> tuple[str, str] | None:
     parsed = urlparse(str(callback_url or ""))
     query = parse_qs(parsed.query)
     state = query.get("state", [""])[0]
     code = query.get("code", [""])[0]
-    if code and state == expected_state:
+    if code and state and (not expected_state or state == expected_state):
         return state, code
     return None
+
+
+def _get_object_url(value) -> str:
+    try:
+        url_value = getattr(value, "url", "")
+        if callable(url_value):
+            return str(url_value() or "")
+        return str(url_value or "")
+    except Exception:
+        return ""
+
+
+def _remember_oauth_callback_url(
+    page,
+    candidate_url: str,
+    progress_logger: ProgressLogger | None = None,
+) -> bool:
+    candidate_url = str(candidate_url or "")
+    if not _parse_callback_code_from_url(candidate_url):
+        return False
+
+    if getattr(page, "_batch_oauth_callback_url", "") == candidate_url:
+        return True
+
+    setattr(page, "_batch_oauth_callback_url", candidate_url)
+    _emit_progress(
+        f"已捕获OAuth回调URL: {_redact_query_value(candidate_url, {'code'})}",
+        progress_logger=progress_logger,
+    )
+    return True
+
+
+def _install_oauth_callback_capture(
+    page,
+    progress_logger: ProgressLogger | None = None,
+) -> None:
+    if getattr(page, "_batch_oauth_callback_capture_installed", False):
+        return
+    setattr(page, "_batch_oauth_callback_capture_installed", True)
+
+    def capture_from_value(value) -> None:
+        _remember_oauth_callback_url(
+            page,
+            _get_object_url(value),
+            progress_logger=progress_logger,
+        )
+
+    try:
+        page.on("request", capture_from_value)
+        page.on("requestfailed", capture_from_value)
+        page.on("framenavigated", capture_from_value)
+    except Exception as exc:
+        _emit_progress(
+            f"安装OAuth回调URL监听器失败，将仅轮询当前地址栏: {exc}",
+            level="warning",
+            progress_logger=progress_logger,
+        )
 
 
 def _build_callback_url(callback_base_url: str, state: str, code: str) -> str:
@@ -448,73 +563,18 @@ def _click_oauth_action_if_present(
             "Đăng nhập",
             *[text for text in action_texts if text not in {"Sign in", "登录", "登入", "Đăng nhập"}],
         ]
-    try:
-        clicked_text = page.evaluate(
-            """(texts) => {
-                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-                const targets = texts.map((text) => normalize(text).toLowerCase()).filter(Boolean);
-                const elements = Array.from(document.querySelectorAll(
-                    [
-                        "button",
-                        "[role='button']",
-                        "[role='link']",
-                        "a",
-                        "input[type='button']",
-                        "input[type='submit']",
-                        "[jscontroller][jsaction]",
-                        "[data-mdc-dialog-action]",
-                        "[tabindex='0']"
-                    ].join(",")
-                ));
-                const candidates = [];
 
-                for (const el of elements) {
-                    const rect = el.getBoundingClientRect();
-                    if (!rect.width || !rect.height) continue;
+    last_click_url = str(getattr(page, "_batch_oauth_last_action_click_url", "") or "")
+    last_click_at = float(getattr(page, "_batch_oauth_last_action_click_at", 0.0) or 0.0)
+    if current_url and current_url == last_click_url and time.monotonic() - last_click_at < 2.0:
+        return False
 
-                    const text = normalize(
-                        el.innerText ||
-                        el.textContent ||
-                        el.value ||
-                        el.getAttribute('aria-label') ||
-                        el.getAttribute('title')
-                    );
-                    if (!text) continue;
-                    candidates.push({ el, text, lowerText: text.toLowerCase() });
-                }
-
-                for (const candidate of candidates) {
-                    const matched = targets.find((target) => candidate.lowerText === target);
-                    if (matched) {
-                        candidate.el.click();
-                        return candidate.text;
-                    }
-                }
-
-                for (const candidate of candidates) {
-                    if (candidate.text.length > 80) continue;
-                    const matched = targets.find((target) =>
-                        candidate.lowerText.includes(target)
-                    );
-                    if (matched) {
-                        candidate.el.click();
-                        return candidate.text;
-                    }
-                }
-
-                return "";
-            }""",
-            action_texts,
-        )
-    except Exception:
-        clicked_text = ""
-
-    if clicked_text:
-        _emit_progress(
-            f"OAuth授权页已点击操作项: {clicked_text}",
-            progress_logger=progress_logger,
-        )
-        return True
+    def mark_action_clicked() -> None:
+        try:
+            setattr(page, "_batch_oauth_last_action_click_url", current_url)
+            setattr(page, "_batch_oauth_last_action_click_at", time.monotonic())
+        except Exception:
+            pass
 
     selectors = []
     if is_nativeapp_signin:
@@ -522,6 +582,12 @@ def _click_oauth_action_if_present(
             [
                 "button:has-text('Sign in')",
                 "div[role='button']:has-text('Sign in')",
+                "[role='link']:has-text('Sign in')",
+                "a:has-text('Sign in')",
+                "button[aria-label='Sign in']",
+                "[role='button'][aria-label='Sign in']",
+                "[role='link'][aria-label='Sign in']",
+                "input[type='submit'][value='Sign in']",
                 "button:has-text('登录')",
                 "button:has-text('登入')",
                 "button:has-text('Đăng nhập')",
@@ -557,6 +623,10 @@ def _click_oauth_action_if_present(
         "div[role='button']:has-text('Cho phép')",
         "div[role='button']:has-text('Đồng ý')",
         "div[role='button']:has-text('Đăng nhập')",
+        "[role='link']:has-text('Continue')",
+        "[role='link']:has-text('Sign in')",
+        "a:has-text('Continue')",
+        "a:has-text('Sign in')",
         "input[type='submit']",
     ])
 
@@ -574,14 +644,128 @@ def _click_oauth_action_if_present(
         if selector not in deduped_selectors:
             deduped_selectors.append(selector)
 
-    clicked_selector = _click_first(
+    clicked_accessible = _click_by_accessible_name(
+        page,
+        action_texts,
+        timeout=500 if is_nativeapp_signin else 800,
+    )
+    if clicked_accessible:
+        mark_action_clicked()
+        _emit_progress(
+            f"OAuth授权页已点击操作项: {clicked_accessible}",
+            progress_logger=progress_logger,
+        )
+        return True
+
+    clicked_selector = _click_first_visible(
         page,
         deduped_selectors,
-        timeout=300 if is_nativeapp_signin else 600,
+        visible_timeout=300 if is_nativeapp_signin else 500,
+        click_timeout=700 if is_nativeapp_signin else 1000,
     )
     if clicked_selector:
+        mark_action_clicked()
         _emit_progress(
             f"OAuth授权页已点击操作项: {clicked_selector}",
+            progress_logger=progress_logger,
+        )
+        return True
+
+    try:
+        clicked_text = page.evaluate(
+            """(texts) => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const targets = texts.map((text) => normalize(text).toLowerCase()).filter(Boolean);
+                const labelledText = (el) => {
+                    const ids = String(el.getAttribute('aria-labelledby') || '')
+                        .split(/\\s+/)
+                        .filter(Boolean);
+                    return ids.map((id) => {
+                        const item = document.getElementById(id);
+                        return item ? normalize(item.innerText || item.textContent) : '';
+                    }).filter(Boolean).join(' ');
+                };
+                const labelText = (el) => normalize(
+                    el.innerText ||
+                    el.textContent ||
+                    el.value ||
+                    el.getAttribute('aria-label') ||
+                    el.getAttribute('title') ||
+                    labelledText(el) ||
+                    Array.from(el.querySelectorAll('[aria-label], img[alt]'))
+                        .map((item) => item.getAttribute('aria-label') || item.getAttribute('alt') || '')
+                        .join(' ')
+                );
+                const fireClick = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const x = rect.left + rect.width / 2;
+                    const y = rect.top + rect.height / 2;
+                    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                        el.dispatchEvent(new MouseEvent(type, {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window,
+                            clientX: x,
+                            clientY: y
+                        }));
+                    }
+                    el.click();
+                };
+                const elements = Array.from(document.querySelectorAll(
+                    [
+                        "button",
+                        "[role='button']",
+                        "[role='link']",
+                        "a",
+                        "input[type='button']",
+                        "input[type='submit']",
+                        "[jscontroller][jsaction]",
+                        "[data-mdc-dialog-action]",
+                        "[tabindex='0']"
+                    ].join(",")
+                ));
+                const candidates = [];
+
+                for (const el of elements) {
+                    const rect = el.getBoundingClientRect();
+                    if (!rect.width || !rect.height) continue;
+                    if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+
+                    const text = labelText(el);
+                    if (!text) continue;
+                    candidates.push({ el, text, lowerText: text.toLowerCase() });
+                }
+
+                for (const candidate of candidates) {
+                    const matched = targets.find((target) => candidate.lowerText === target);
+                    if (matched) {
+                        fireClick(candidate.el);
+                        return candidate.text;
+                    }
+                }
+
+                for (const candidate of candidates) {
+                    if (candidate.text.length > 80) continue;
+                    const matched = targets.find((target) =>
+                        candidate.lowerText.includes(target)
+                    );
+                    if (matched) {
+                        fireClick(candidate.el);
+                        return candidate.text;
+                    }
+                }
+
+                return "";
+            }""",
+            action_texts,
+        )
+    except Exception:
+        clicked_text = ""
+
+    if clicked_text:
+        mark_action_clicked()
+        _emit_progress(
+            f"OAuth授权页已点击操作项: {clicked_text}",
             progress_logger=progress_logger,
         )
         return True
@@ -973,6 +1157,14 @@ def _wait_for_oauth_callback(
     last_logged_url = ""
 
     while time.monotonic() - start_time < timeout_seconds:
+        captured_url = str(getattr(page, "_batch_oauth_callback_url", "") or "")
+        if _parse_callback_code_from_url(captured_url):
+            _emit_progress(
+                "已从浏览器请求记录捕获OAuth回调URL，准备继续处理",
+                progress_logger=progress_logger,
+            )
+            return captured_url
+
         flow_data = auth_flows.get(state) or {}
         code = flow_data.get("code")
         if code:
@@ -984,16 +1176,20 @@ def _wait_for_oauth_callback(
         current_url = str(getattr(page, "url", "") or "")
         if current_url and current_url != last_logged_url:
             last_logged_url = current_url
-            if "accounts.google.com" in current_url or "localhost" in current_url:
+            if "accounts.google.com" in current_url or _parse_callback_code_from_url(current_url):
                 _emit_progress(
                     f"OAuth当前地址: {_redact_query_value(current_url, {'code'})}",
                     progress_logger=progress_logger,
                 )
 
-        _raise_if_service_unavailable_page(page, progress_logger=progress_logger)
+        if _remember_oauth_callback_url(page, current_url, progress_logger=progress_logger):
+            _emit_progress(
+                "已检测到地址栏OAuth回调URL，准备继续处理",
+                progress_logger=progress_logger,
+            )
+            return str(getattr(page, "_batch_oauth_callback_url", "") or current_url)
 
-        if _parse_callback_code_from_url(current_url, state):
-            return current_url
+        _raise_if_service_unavailable_page(page, progress_logger=progress_logger)
 
         if _submit_password_if_present(page, password, progress_logger=progress_logger):
             page.wait_for_timeout(1000)
@@ -3099,6 +3295,66 @@ async def _build_cached_credential_from_callback_url(
         _cleanup_auth_flow_server(state)
 
 
+async def _build_cached_credential_from_origin_callback_url(
+    callback_url: str,
+    proxy_url: str,
+    mode: str = "geminicli",
+    progress_logger: ProgressLogger | None = None,
+) -> dict:
+    mode = _normalize_credential_mode(mode)
+    mode_label = _credential_mode_label(mode)
+    base_url = _origin_base_url()
+    if not base_url:
+        raise RuntimeError("未配置远程服务地址，无法通过远程服务认证回调URL")
+
+    _emit_progress(
+        "已从地址栏获取OAuth回调URL，正在发送到远程服务认证",
+        progress_logger=progress_logger,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{base_url}/auth/callback-url",
+                json={
+                    "callback_url": callback_url,
+                    "mode": mode,
+                    "persist_credentials": False,
+                    "proxy_url": proxy_url or "",
+                },
+                headers=_origin_auth_headers(),
+            )
+    except Exception as exc:
+        raise RuntimeError(f"将回调URL发送到远程服务失败: {exc}") from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+
+    if response.status_code >= 400:
+        detail = data.get("detail") or data.get("error") or response.text
+        raise RuntimeError(f"远程服务处理回调URL失败: HTTP {response.status_code}, {detail}")
+
+    credential_data = dict(data.get("credentials") or {})
+    if not credential_data:
+        raise RuntimeError("远程服务未返回临时凭证")
+
+    project_id = str(data.get("project_id") or credential_data.get("project_id") or "").strip()
+    if not project_id:
+        raise RuntimeError("远程服务返回的临时凭证缺少 project_id")
+
+    _emit_progress(
+        f"远程服务已完成{mode_label}认证，临时凭证已返回",
+        progress_logger=progress_logger,
+    )
+    return {
+        "credentials": credential_data,
+        "project_id": project_id,
+        "subscription_tier": data.get("subscription_tier"),
+        "mode": data.get("mode") or mode,
+    }
+
+
 def _authorize_logged_in_account_and_test(
     page,
     email: str,
@@ -3114,6 +3370,12 @@ def _authorize_logged_in_account_and_test(
 
     mode = _normalize_credential_mode(mode)
     mode_label = _credential_mode_label(mode)
+    use_origin_callback = _use_origin_callback_api()
+    if use_origin_callback:
+        _emit_progress(
+            f"检测到远程服务配置，将在本地生成{mode_label} OAuth授权链接并把回调URL发送到远程认证",
+            progress_logger=progress_logger,
+        )
     _emit_progress(f"正在生成{mode_label} OAuth授权链接", progress_logger=progress_logger)
     auth_result = _run_async(create_auth_url(user_session="batch_generate", mode=mode))
     if not auth_result.get("success"):
@@ -3126,7 +3388,8 @@ def _authorize_logged_in_account_and_test(
     state = auth_result["state"]
     try:
         _emit_progress("OAuth授权链接已生成，正在使用当前已登录账号打开", progress_logger=progress_logger)
-        _goto_english(page, auth_url, wait_until="domcontentloaded", timeout=60000)
+        _install_oauth_callback_capture(page, progress_logger=progress_logger)
+        _open_oauth_auth_url(page, auth_url, state, progress_logger=progress_logger)
 
         callback_url = _wait_for_oauth_callback(
             page,
@@ -3142,14 +3405,34 @@ def _authorize_logged_in_account_and_test(
             progress_logger=progress_logger,
         )
 
-        result = _run_async(
-            _build_cached_credential_from_callback_url(
-                callback_url,
-                proxy_url,
-                mode=mode,
-                progress_logger=progress_logger,
+        if use_origin_callback:
+            result = _run_async(
+                _build_cached_credential_from_origin_callback_url(
+                    callback_url,
+                    proxy_url,
+                    mode=mode,
+                    progress_logger=progress_logger,
+                )
             )
-        )
+        else:
+            result = _run_async(
+                _build_cached_credential_from_callback_url(
+                    callback_url,
+                    proxy_url,
+                    mode=mode,
+                    progress_logger=progress_logger,
+                )
+            )
+
+        if result.get("credentials") and not result.get("test"):
+            result["test"] = _run_async(
+                _test_cached_gemini_credential(
+                    result["credentials"],
+                    proxy_url,
+                    mode=mode,
+                    progress_logger=progress_logger,
+                )
+            )
     except AccountUnusableError as exc:
         _cleanup_auth_flow_server(state)
         return {
@@ -3165,6 +3448,9 @@ def _authorize_logged_in_account_and_test(
     except Exception:
         _cleanup_auth_flow_server(state)
         raise
+    finally:
+        if use_origin_callback:
+            _cleanup_auth_flow_server(state)
 
     validation_url = (result.get("test") or {}).get("validation_url")
     if validation_url:
@@ -3329,6 +3615,34 @@ def _click_first(page, selectors: list[str], timeout: int = 5000) -> str | None:
             return selector
         except Exception:
             continue
+    return None
+
+
+def _click_by_accessible_name(
+    page,
+    texts: list[str],
+    roles: tuple[str, ...] = ("button", "link"),
+    timeout: int = 800,
+) -> str | None:
+    for text in texts:
+        text = str(text or "").strip()
+        if not text:
+            continue
+
+        exact_pattern = re.compile(rf"^\s*{re.escape(text)}\s*$", re.IGNORECASE)
+        partial_pattern = re.compile(re.escape(text), re.IGNORECASE)
+        for role in roles:
+            for pattern in (exact_pattern, partial_pattern):
+                try:
+                    locator = page.get_by_role(role, name=pattern).first
+                    if locator.count() < 1:
+                        continue
+                    locator.scroll_into_view_if_needed(timeout=timeout)
+                    locator.click(timeout=timeout)
+                    return f"role={role}, name~={text}"
+                except Exception:
+                    continue
+
     return None
 
 
@@ -3507,13 +3821,14 @@ def run_google_login(
     email = str(email or "").strip()
     password = str(password or "")
     proxy = _parse_playwright_proxy(proxy_url)
+    chrome_cdp_url = _batch_generate_chrome_cdp_url()
     login_url = (
         "https://accounts.google.com/signin/v2/identifier"
         "?service=accountsettings&continue=https%3A%2F%2Fmyaccount.google.com%2F"
     )
 
     _emit_progress(
-        f"启动Chrome无痕登录并生成{mode_label}凭证: email={email}, "
+        f"启动{'本机Chrome CDP' if chrome_cdp_url else 'Chrome无痕'}登录并生成{mode_label}凭证: email={email}, "
         f"proxy={'enabled' if proxy else 'disabled'}, phone={'set' if phone else '-'}, "
         f"phone_code_url={'set' if phone_code_url else '-'}, "
         f"2fa={'set' if two_fa_key else '-'}",
@@ -3522,25 +3837,58 @@ def run_google_login(
 
     with sync_playwright() as playwright:
         result = {}
-        _emit_progress("正在启动Chrome浏览器", progress_logger=progress_logger)
-        browser = playwright.chromium.launch(
-            channel="chrome",
-            headless=False,
-            args=[
-                "--incognito",
-                "--window-size=1280,900",
-                "--window-position=120,80",
-                "--lang=en-US",
-                "--accept-lang=en-US,en",
-            ],
-        )
+        context = None
+        page = None
+        close_browser = True
+        close_context = False
+        if chrome_cdp_url:
+            _emit_progress(f"正在连接本机Chrome CDP: {chrome_cdp_url}", progress_logger=progress_logger)
+            browser = playwright.chromium.connect_over_cdp(chrome_cdp_url)
+            close_browser = False
+            if proxy:
+                _emit_progress(
+                    "本机Chrome CDP模式下代理需在启动Chrome时配置，任务内代理参数可能无法生效",
+                    level="warning",
+                    progress_logger=progress_logger,
+                )
+        else:
+            _emit_progress("正在启动Chrome浏览器", progress_logger=progress_logger)
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=False,
+                args=[
+                    "--incognito",
+                    "--window-size=1280,900",
+                    "--window-position=120,80",
+                    "--lang=en-US",
+                    "--accept-lang=en-US,en",
+                ],
+            )
+
         _emit_progress("正在创建无痕浏览器上下文", progress_logger=progress_logger)
-        context = browser.new_context(
-            no_viewport=True,
-            proxy=proxy,
-            locale="en-US",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
+        context_options = {
+            "no_viewport": True,
+            "locale": "en-US",
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
+        if proxy:
+            context_options["proxy"] = proxy
+        try:
+            context = browser.new_context(**context_options)
+            close_context = True
+        except Exception as exc:
+            if not chrome_cdp_url or not browser.contexts:
+                raise
+            _emit_progress(
+                f"CDP模式创建无痕上下文失败，改用本机Chrome默认上下文: {exc}",
+                level="warning",
+                progress_logger=progress_logger,
+            )
+            context = browser.contexts[0]
+            try:
+                context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+            except Exception:
+                pass
         _install_english_navigation_guard(context, progress_logger=progress_logger)
         page = context.new_page()
 
@@ -3670,14 +4018,21 @@ def run_google_login(
                 pass
         finally:
             _emit_progress("正在关闭浏览器上下文", progress_logger=progress_logger)
-            try:
-                page.close(run_before_unload=False)
-            except Exception:
-                pass
-            try:
-                browser.close(reason="batch_generate_done")
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    page.close(run_before_unload=False)
+                except Exception:
+                    pass
+            if close_context and context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if close_browser:
+                try:
+                    browser.close(reason="batch_generate_done")
+                except Exception:
+                    pass
             _emit_progress("Chrome登录任务已结束", progress_logger=progress_logger)
 
         return result

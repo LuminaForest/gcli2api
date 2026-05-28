@@ -1,0 +1,15 @@
+services:
+  gcli2api-batch-generator:
+    image: tummifix/gcli2api-batch-generator:latest
+    platform: linux/amd64
+    container_name: gcli2api-batch-generator
+    command: python batch_generator_web.py
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.gateway:host-gateway"
+    ports:
+      - "${BATCH_GENERATOR_PORT:-7863}:7863"
+    environment:
+      - BATCH_GENERATE_CHROME_CDP_URL=${BATCH_GENERATE_CHROME_CDP_URL:-http://host.docker.gateway:9222}
+    volumes:
+      - ./data/batch-generator:/app/creds

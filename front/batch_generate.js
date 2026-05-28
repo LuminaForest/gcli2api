@@ -7,9 +7,12 @@
 
     const state = {
         selectedFile: null,
+        selectedFileText: '',
         generatorUrl: '',
         currentProxyUrl: '',
         isGeneratingProxy: false,
+        isReadingFile: false,
+        fileReadSeq: 0,
         activeTaskId: '',
         activeTaskDone: null,
         lastTaskLogSeq: 0,
@@ -85,6 +88,22 @@
         element.style.whiteSpace = 'pre-wrap';
         element.style.wordBreak = 'break-word';
         element.textContent = message;
+    }
+
+    function setBatchStatus(message = '', type = 'info') {
+        if (getElement('batchGenerateAccountStatus')) {
+            setAccountStatus(message, type);
+        } else if (typeof showStatus === 'function') {
+            showStatus(message, type);
+        }
+    }
+
+    function setProxyStatus(message = '', type = 'info') {
+        if (typeof showProxyStatus === 'function') {
+            showProxyStatus(message, type);
+        } else if (typeof showStatus === 'function') {
+            showStatus(message, type);
+        }
     }
 
     function formatFailureReason(reason) {
@@ -163,25 +182,35 @@
         );
     }
 
-    function recordFailedAccount(account, reason) {
+    function formatFailedAccount(account, reason) {
         const email = String(account?.email || '').trim();
-        if (!email) return;
+        if (!email) return '';
+
+        const line = account.line_number ? `第 ${account.line_number} 行 ` : '';
+        const reasonText = formatFailureReason(reason);
+        const reasonSuffix = reasonText ? `（${reasonText}）` : '';
+        return `${line}${email}${reasonSuffix}`;
+    }
+
+    function recordFailedAccount(account, reason) {
+        const text = formatFailedAccount(account, reason);
+        if (!text) return '';
 
         state.failedAccounts.push({
             line_number: account.line_number,
-            email,
-            reason: formatFailureReason(reason)
+            email: String(account?.email || '').trim(),
+            reason: formatFailureReason(reason),
+            text
         });
+        appendLog(`失败邮箱：${text}`);
+        return text;
     }
 
     function formatFailedAccounts() {
         return state.failedAccounts
-            .map(item => {
-                const line = item.line_number ? `第 ${item.line_number} 行 ` : '';
-                const reason = item.reason ? `（${item.reason}）` : '';
-                return `${line}${item.email}${reason}`;
-            })
-            .join('，');
+            .map(item => item.text || formatFailedAccount(item, item.reason))
+            .filter(Boolean)
+            .join('\n');
     }
 
     function setStartButtonsDisabled(disabled, activeMode = state.activeMode) {
@@ -327,7 +356,7 @@
         const isAuto = Boolean(options.auto);
 
         if (!generatorUrl) {
-            showStatus('请先在代理池管理中填写并保存凭证代理生成链接', 'error');
+            setProxyStatus('请先在代理池管理中填写并保存凭证代理生成链接', 'error');
             return '';
         }
 
@@ -349,7 +378,7 @@
             const data = await response.json();
 
             if (!response.ok) {
-            showStatus(`${isAuto ? '自动生成代理地址' : '切换代理地址'}失败: ${data.detail || data.error || '未知错误'}`, 'error');
+                setProxyStatus(`${isAuto ? '自动生成代理地址' : '切换代理地址'}失败: ${data.detail || data.error || '未知错误'}`, 'error');
                 return '';
             }
 
@@ -357,10 +386,10 @@
             await saveBatchGenerateProxyUrl(generatedUrl);
             state.currentProxyUrl = generatedUrl;
             updateProxyDisplay();
-            showStatus(isAuto ? '已自动生成并保存代理地址' : '代理地址已切换并保存', 'success');
+            setProxyStatus(isAuto ? '已自动生成并保存代理地址' : '代理地址已切换并保存', 'success');
             return generatedUrl;
         } catch (error) {
-            showStatus(`${isAuto ? '自动生成代理地址' : '切换代理地址'}失败: ${error.message}`, 'error');
+            setProxyStatus(`${isAuto ? '自动生成代理地址' : '切换代理地址'}失败: ${error.message}`, 'error');
             return '';
         } finally {
             state.isGeneratingProxy = false;
@@ -404,22 +433,96 @@
         );
     }
 
-    function setFile(file) {
+    function readTextFile(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = event => resolve(String(event.target?.result || ''));
+            reader.onerror = () => reject(reader.error || new Error('浏览器无法读取该文件'));
+            reader.onabort = () => reject(new Error('文件读取已取消'));
+            reader.readAsText(file, 'utf-8');
+        });
+    }
+
+    function formatFileReadError(error) {
+        const name = error?.name || '';
+        const message = error?.message || '';
+        if (name === 'NotReadableError') {
+            return '文件暂时不可读，可能已被移动、覆盖，或正被同步软件/其他程序占用';
+        }
+        if (name === 'NotFoundError') {
+            return '文件不存在或已被移动';
+        }
+        if (name === 'SecurityError') {
+            return '浏览器安全策略阻止读取该文件，请重新选择文件';
+        }
+        return message || name || '未知错误';
+    }
+
+    async function setFile(file) {
+        const readSeq = ++state.fileReadSeq;
+        state.selectedFile = null;
+        state.selectedFileText = '';
+        state.isReadingFile = false;
+        updateFileList();
+
         if (!isTxtFile(file)) {
-            showStatus(`文件 ${file ? file.name : ''} 格式不支持，只支持TXT文件`, 'error');
+            setBatchStatus(`文件 ${file ? file.name : ''} 格式不支持，只支持TXT文件`, 'error');
             return;
         }
 
-        state.selectedFile = file;
-        updateFileList();
         const sizeText = typeof formatFileSize === 'function'
             ? formatFileSize(file.size)
             : `${file.size} B`;
-        appendLog(`已选择文件: ${file.name} (${sizeText})`, true);
+        state.isReadingFile = true;
+        setBatchStatus('正在读取txt文件...', 'info');
+        appendLog(`正在读取文件: ${file.name} (${sizeText})`, true);
+
+        try {
+            const text = await readTextFile(file);
+            if (readSeq !== state.fileReadSeq) return;
+            state.selectedFile = file;
+            state.selectedFileText = text;
+            updateFileList();
+            setBatchStatus('txt文件已读取，可以开始生成凭证', 'success');
+            appendLog(`已读取文件: ${file.name} (${sizeText})`, true);
+        } catch (error) {
+            if (readSeq !== state.fileReadSeq) return;
+            const reason = formatFileReadError(error);
+            state.selectedFile = null;
+            state.selectedFileText = '';
+            updateFileList();
+            setBatchStatus(`读取txt文件失败: ${reason}`, 'error');
+            appendLog(`读取txt文件失败: ${reason}`, true);
+        } finally {
+            if (readSeq === state.fileReadSeq) {
+                state.isReadingFile = false;
+                const input = getElement('batchGenerateFileInput');
+                if (input) input.value = '';
+            }
+        }
+    }
+
+    function normalizeAccountLine(line) {
+        return String(line || '')
+            .replace(/\u0000/g, '')
+            .replace(/\u001a+$/g, '')
+            .trim();
+    }
+
+    function splitAccountText(text) {
+        const normalizedText = String(text || '').replace(/^\uFEFF/, '');
+        const lines = normalizedText.split(/\r\n|\n|\r|\u2028|\u2029/g);
+        if (lines.length > 1 && normalizeAccountLine(lines[lines.length - 1]) === '') {
+            lines.pop();
+        }
+        return lines.map((line, index) => ({
+            line_number: index + 1,
+            text: normalizeAccountLine(line)
+        }));
     }
 
     function parseAccountLine(line, lineNumber = 1) {
-        const parts = String(line || '').split('|').map(part => part.trim());
+        const parts = normalizeAccountLine(line).split('|').map(part => part.trim());
         if (parts.length < 2 || !parts[0] || !parts[1]) {
             throw new Error(`第 ${lineNumber} 行格式不正确，至少需要：谷歌账号|密码`);
         }
@@ -646,8 +749,9 @@
                     }
 
                     failedCount += 1;
-                    const reason = formatFailureReason(taskResult.failure_reason || taskResult.error || '处理失败');
-                    recordFailedAccount(account, reason);
+                    const failureReason = taskResult.failure_reason || taskResult.error || '处理失败';
+                    const reason = formatFailureReason(failureReason);
+                    recordFailedAccount(account, failureReason);
                     const message = `第 ${account.line_number} 行账号 ${account.email} 处理失败，原因: ${reason}，继续处理下一行`;
                     setAccountStatus(message, 'warning');
                     appendLog(message);
@@ -665,14 +769,9 @@
                 `批量处理结束：保存成功 ${savedCount}，未入库 ${saveSkippedCount}，` +
                 `跳过 ${skippedCount}，不可用 ${unusableCount}，失败 ${failedCount}，总计 ${accounts.length}`;
             const failedAccounts = formatFailedAccounts();
-            const finalMessage = failedAccounts ? `${summary}\n失败邮箱：${failedAccounts}` : summary;
+            const finalMessage = failedAccounts ? `${summary}\n失败详情：\n${failedAccounts}` : summary;
             setAccountStatus(finalMessage, unusableCount || failedCount || saveSkippedCount ? 'warning' : 'success');
             appendLog(summary);
-            if (failedAccounts) appendLog(`失败邮箱：${failedAccounts}`);
-            showStatus(
-                finalMessage.replace(/\n/g, '；'),
-                unusableCount || failedCount || saveSkippedCount ? 'warning' : 'success'
-            );
         } finally {
             state.isBatchRunning = false;
             setStartButtonsDisabled(false, config.mode);
@@ -688,7 +787,7 @@
             const response = await fetch('./config/get', { headers: getAuthHeaderValues() });
             const data = await response.json();
             if (!response.ok) {
-                showStatus(`加载凭证代理生成链接失败: ${data.detail || data.error || '未知错误'}`, 'error');
+                setProxyStatus(`加载凭证代理生成链接失败: ${data.detail || data.error || '未知错误'}`, 'error');
                 return;
             }
 
@@ -697,13 +796,23 @@
             const httpProxyUrl = toHttpProxyUrl(savedProxyUrl);
             state.currentProxyUrl = httpProxyUrl || state.currentProxyUrl || '';
             updateProxyDisplay();
+            if (data.origin_config_error) {
+                setProxyStatus('');
+                return;
+            }
+            if (!state.generatorUrl) {
+                setProxyStatus('未从原项目加载到凭证代理生成链接，请先在原项目代理池管理中保存凭证代理生成链接', 'warning');
+                return;
+            }
             if (savedProxyUrl && httpProxyUrl && savedProxyUrl !== httpProxyUrl) {
                 await saveBatchGenerateProxyUrl(httpProxyUrl);
             } else if (!state.currentProxyUrl) {
                 await generateAndSaveProxy({ auto: true });
+            } else {
+                setProxyStatus('');
             }
         } catch (error) {
-            showStatus(`加载凭证代理生成链接失败: ${error.message}`, 'error');
+            setProxyStatus(`加载凭证代理生成链接失败: ${error.message}`, 'error');
         }
     }
 
@@ -714,12 +823,12 @@
     function handleFileSelect(event) {
         const files = Array.from(event.target.files || []);
         if (files.length > 1) {
-            showStatus('这里只能上传一个TXT文件', 'error');
+            setBatchStatus('这里只能上传一个TXT文件', 'error');
             event.target.value = '';
             return;
         }
 
-        if (files[0]) setFile(files[0]);
+        if (files[0]) void setFile(files[0]);
     }
 
     function handleFileDrop(event) {
@@ -734,11 +843,11 @@
 
         const files = Array.from(event.dataTransfer.files || []);
         if (files.length > 1) {
-            showStatus('这里只能上传一个TXT文件', 'error');
+            setBatchStatus('这里只能上传一个TXT文件', 'error');
             return;
         }
 
-        if (files[0]) setFile(files[0]);
+        if (files[0]) void setFile(files[0]);
     }
 
     function handleDragOver(event) {
@@ -769,6 +878,9 @@
         state.accounts = [];
         state.failedAccounts = [];
         state.selectedFile = null;
+        state.selectedFileText = '';
+        state.isReadingFile = false;
+        state.fileReadSeq += 1;
         const input = getElement('batchGenerateFileInput');
         if (input) input.value = '';
         updateFileList();
@@ -779,7 +891,7 @@
     function start(mode = 'geminicli') {
         const config = getModeConfig(mode);
         if (state.isBatchRunning) {
-            showStatus('当前已有批量生成任务正在运行', 'warning');
+            setBatchStatus('当前已有批量生成任务正在运行', 'warning');
             return;
         }
 
@@ -790,56 +902,59 @@
         state.lastTaskLogSeq = 0;
         setAccountStatus('');
 
+        if (state.isReadingFile) {
+            setBatchStatus('txt文件正在读取，请稍后再开始', 'warning');
+            return;
+        }
+
         if (!state.selectedFile) {
-            showStatus('请先上传txt文件', 'error');
+            setBatchStatus('请先上传txt文件', 'error');
             appendLog(`未选择txt文件，无法开始生成${config.credentialLabel}`, true);
             return;
         }
 
-        const reader = new FileReader();
-        reader.onload = async function(event) {
-            const text = String(event.target.result || '');
-            const lines = text.split(/\r?\n/)
-                .map(line => line.trim())
-                .filter(Boolean);
+        void (async () => {
+            const text = String(state.selectedFileText || '');
+            const physicalLines = splitAccountText(text);
+            const lines = physicalLines.filter(line => Boolean(line.text));
 
             if (!lines.length) {
-                showStatus('txt文件没有可用数据', 'error');
+                setBatchStatus('txt文件没有可用数据', 'error');
                 appendLog('txt文件没有可用数据', true);
                 return;
             }
 
             try {
                 const accounts = [];
-                appendLog(`读取到 ${lines.length} 行有效文本，开始解析账号，目标: ${config.managementLabel}`, true);
-                lines.forEach((line, index) => {
+                const ignoredBlankCount = physicalLines.length - lines.length;
+                appendLog(
+                    `读取到 ${lines.length} 行有效文本，原始行数 ${physicalLines.length}，开始解析账号，目标: ${config.managementLabel}`,
+                    true
+                );
+                if (ignoredBlankCount > 0) {
+                    appendLog(`已忽略 ${ignoredBlankCount} 行空白内容`);
+                }
+                lines.forEach(line => {
                     try {
-                        accounts.push(parseAccountLine(line, index + 1));
+                        accounts.push(parseAccountLine(line.text, line.line_number));
                     } catch (error) {
                         appendLog(`${error.message}，已跳过`);
                     }
                 });
 
                 if (!accounts.length) {
-                    showStatus('txt文件没有可用账号数据', 'error');
-                    setAccountStatus('txt文件没有可用账号数据', 'error');
+                    setBatchStatus('txt文件没有可用账号数据', 'error');
                     return;
                 }
 
                 appendLog(`解析到 ${accounts.length} 个可用账号，将按行顺序逐个生成${config.credentialLabel}`);
-                showStatus(`已解析账号，开始生成${config.credentialLabel}`, 'success');
+                setBatchStatus(`已解析账号，开始生成${config.credentialLabel}`, 'success');
                 await processAccounts(accounts, config.mode);
             } catch (error) {
                 appendLog(`启动失败: ${error.message}`);
-                setAccountStatus(`启动失败: ${error.message}`, 'error');
-                showStatus(`启动失败: ${error.message}`, 'error');
+                setBatchStatus(`启动失败: ${error.message}`, 'error');
             }
-        };
-        reader.onerror = function() {
-            showStatus('读取txt文件失败', 'error');
-            appendLog('读取txt文件失败', true);
-        };
-        reader.readAsText(state.selectedFile, 'utf-8');
+        })();
     }
 
     window.BatchGenerate = {

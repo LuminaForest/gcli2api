@@ -10,9 +10,15 @@ import uuid
 from datetime import timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
-from config import get_config_value, get_antigravity_api_url, get_code_assist_endpoint
+from config import (
+    format_proxy_for_httpx,
+    get_antigravity_api_url,
+    get_code_assist_endpoint,
+    get_config_value,
+    validate_proxy_url,
+)
 from log import log
 
 from .google_oauth_api import (
@@ -336,6 +342,205 @@ async def create_auth_url(
 
     except Exception as e:
         log.error(f"创建认证URL失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def _build_oauth_proxy_kwargs(proxy_url: Optional[str] = None) -> Dict[str, Any]:
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        return {}
+
+    return {
+        "proxy": format_proxy_for_httpx(validate_proxy_url(proxy_url)),
+        "trust_env": False,
+    }
+
+
+def _is_transient_oauth_exchange_error(error: Exception) -> bool:
+    error_text = str(error or "").lower()
+    transient_markers = (
+        "server disconnected without sending a response",
+        "remoteprotocolerror",
+        "readerror",
+        "connecterror",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "connection timed out",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+    )
+    return any(marker in error_text for marker in transient_markers)
+
+
+async def _exchange_code_with_retry(
+    flow: Flow,
+    code: str,
+    proxy_kwargs: Optional[Dict[str, Any]] = None,
+    attempts: int = 3,
+) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            if attempt > 1:
+                log.warning(f"OAuth token交换重试: attempt={attempt}/{attempts}")
+            return await flow.exchange_code(code, proxy_kwargs=proxy_kwargs or None)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts or not _is_transient_oauth_exchange_error(exc):
+                raise
+            await asyncio.sleep(0.8 * attempt)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("OAuth token交换失败")
+
+
+async def _exchange_callback_code_for_credentials(
+    callback_url: str,
+    mode: str = "geminicli",
+    proxy_url: Optional[str] = None,
+    allow_stateless: bool = False,
+) -> Dict[str, Any]:
+    try:
+        log.info(f"开始从回调URL交换访问令牌: {callback_url}")
+
+        parsed_url = urlparse(callback_url)
+        query_params = parse_qs(parsed_url.query)
+
+        if "state" not in query_params or "code" not in query_params:
+            return {"success": False, "error": "回调URL缺少必要参数 (state 或 code)"}
+
+        state = query_params["state"][0]
+        code = query_params["code"][0]
+
+        log.info(f"从URL解析到: state={state}, code=xxx...")
+
+        flow_data = auth_flows.get(state)
+        if not flow_data and not allow_stateless:
+            return {
+                "success": False,
+                "error": f"未找到对应的认证流程，请先启动认证 (state: {state})",
+            }
+
+        if flow_data:
+            flow = flow_data["flow"]
+            cred_mode = flow_data.get("mode", "geminicli") if flow_data.get("mode") else mode
+        else:
+            cred_mode = "antigravity" if str(mode or "").strip() == "antigravity" else "geminicli"
+            redirect_path = "" if parsed_url.path in ("", "/") else parsed_url.path
+            redirect_uri = urlunparse(
+                (
+                    parsed_url.scheme,
+                    parsed_url.netloc,
+                    redirect_path,
+                    "",
+                    "",
+                    "",
+                )
+            )
+            if cred_mode == "antigravity":
+                client_id = ANTIGRAVITY_CLIENT_ID
+                client_secret = ANTIGRAVITY_CLIENT_SECRET
+                scopes = ANTIGRAVITY_SCOPES
+            else:
+                client_id = CLIENT_ID
+                client_secret = CLIENT_SECRET
+                scopes = SCOPES
+
+            flow = Flow(
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=scopes,
+                redirect_uri=redirect_uri,
+            )
+            log.warning(
+                "未在当前进程找到OAuth流程，已根据回调URL重建临时flow: "
+                f"state={state}, redirect_uri={redirect_uri}, mode={cred_mode}"
+            )
+
+        proxy_kwargs = _build_oauth_proxy_kwargs(proxy_url)
+
+        log.info(f"使用redirect_uri: {flow.redirect_uri}")
+        credentials = await _exchange_code_with_retry(flow, code, proxy_kwargs=proxy_kwargs or None)
+        log.info("成功获取访问令牌")
+
+        return {
+            "success": True,
+            "state": state,
+            "mode": cred_mode,
+            "credentials_obj": credentials,
+            "proxy_kwargs": proxy_kwargs,
+        }
+    except Exception as e:
+        log.error(f"从回调URL交换访问令牌失败: {e}")
+        return {"success": False, "error": f"获取凭证失败: {str(e)}"}
+
+
+async def build_temporary_credentials_from_callback_url(
+    callback_url: str,
+    mode: str = "geminicli",
+    proxy_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        exchange_result = await _exchange_callback_code_for_credentials(
+            callback_url,
+            mode=mode,
+            proxy_url=proxy_url,
+            allow_stateless=True,
+        )
+        if not exchange_result.get("success"):
+            return exchange_result
+
+        state = exchange_result["state"]
+        cred_mode = exchange_result["mode"]
+        credentials = exchange_result["credentials_obj"]
+        proxy_kwargs = exchange_result.get("proxy_kwargs") or None
+        subscription_tier = None
+        project_id = None
+
+        try:
+            if cred_mode == "antigravity":
+                log.info("批量回调认证：从Antigravity API检测 project_id")
+                api_base_url = await get_antigravity_api_url()
+                user_agent = ANTIGRAVITY_USER_AGENT
+            else:
+                log.info("批量回调认证：从Code Assist API检测 project_id")
+                api_base_url = await get_code_assist_endpoint()
+                user_agent = GEMINICLI_USER_AGENT
+
+            project_id, subscription_tier = await fetch_project_id_and_tier(
+                credentials.access_token,
+                user_agent,
+                api_base_url,
+                proxy_kwargs=proxy_kwargs,
+            )
+        except Exception as e:
+            log.warning(f"批量回调认证自动检测 project_id 失败，将使用默认项目ID: {e}")
+
+        if not project_id:
+            project_id = DEFAULT_PROJECT_ID
+            log.warning(f"批量回调认证未检测到 project_id，使用默认项目ID: {project_id}")
+
+        creds_data = _prepare_credentials_data(
+            credentials,
+            project_id,
+            mode=cred_mode,
+            subscription_tier=subscription_tier,
+        )
+
+        _cleanup_auth_flow_server(state)
+        return {
+            "success": True,
+            "credentials": creds_data,
+            "project_id": project_id,
+            "subscription_tier": subscription_tier,
+            "mode": cred_mode,
+        }
+    except Exception as e:
+        log.error(f"从回调URL构建临时凭证失败: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -789,46 +994,28 @@ async def asyncio_complete_auth_flow(
 
 
 async def complete_auth_flow_from_callback_url(
-    callback_url: str, project_id: Optional[str] = None, mode: str = "geminicli"
+    callback_url: str,
+    project_id: Optional[str] = None,
+    mode: str = "geminicli",
+    proxy_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """从回调URL直接完成认证流程，无需启动本地服务器"""
     try:
         log.info(f"开始从回调URL完成认证: {callback_url}")
+        exchange_result = await _exchange_callback_code_for_credentials(
+            callback_url,
+            mode=mode,
+            proxy_url=proxy_url,
+        )
+        if not exchange_result.get("success"):
+            return exchange_result
 
-        # 解析回调URL
-        parsed_url = urlparse(callback_url)
-        query_params = parse_qs(parsed_url.query)
-
-        # 验证必要参数
-        if "state" not in query_params or "code" not in query_params:
-            return {"success": False, "error": "回调URL缺少必要参数 (state 或 code)"}
-
-        state = query_params["state"][0]
-        code = query_params["code"][0]
-
-        log.info(f"从URL解析到: state={state}, code=xxx...")
-
-        # 检查是否有对应的认证流程
-        if state not in auth_flows:
-            return {
-                "success": False,
-                "error": f"未找到对应的认证流程，请先启动认证 (state: {state})",
-            }
-
-        flow_data = auth_flows[state]
-        flow = flow_data["flow"]
-
-        # 构造回调URL（使用flow中存储的redirect_uri）
-        redirect_uri = flow.redirect_uri
-        log.info(f"使用redirect_uri: {redirect_uri}")
+        state = exchange_result["state"]
+        credentials = exchange_result["credentials_obj"]
+        cred_mode = exchange_result["mode"]
+        proxy_kwargs = exchange_result.get("proxy_kwargs") or None
 
         try:
-            # 使用authorization code获取token
-            credentials = await flow.exchange_code(code)
-            log.info("成功获取访问令牌")
-
-            # 检查凭证模式
-            cred_mode = flow_data.get("mode", "geminicli") if flow_data.get("mode") else mode
             if cred_mode == "antigravity":
                 log.info("Antigravity模式（从回调URL）：从API获取project_id...")
                 # 使用API获取project_id
@@ -836,7 +1023,8 @@ async def complete_auth_flow_from_callback_url(
                 project_id, subscription_tier = await fetch_project_id_and_tier(
                     credentials.access_token,
                     ANTIGRAVITY_USER_AGENT,
-                    antigravity_url
+                    antigravity_url,
+                    proxy_kwargs=proxy_kwargs,
                 )
                 if project_id:
                     log.info(f"成功从API获取project_id: {project_id}, tier: {subscription_tier}")
@@ -875,7 +1063,8 @@ async def complete_auth_flow_from_callback_url(
                     detected_project_id, subscription_tier = await fetch_project_id_and_tier(
                         credentials.access_token,
                         GEMINICLI_USER_AGENT,
-                        code_assist_url
+                        code_assist_url,
+                        proxy_kwargs=proxy_kwargs,
                     )
                     if detected_project_id:
                         auto_detected = True

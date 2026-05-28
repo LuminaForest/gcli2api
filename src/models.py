@@ -363,6 +363,8 @@ class AuthCallbackUrlRequest(BaseModel):
     callback_url: str  # OAuth回调完整URL
     project_id: Optional[str] = None  # 可选的项目ID
     mode: Optional[str] = "geminicli"  # 凭证模式: geminicli 或 antigravity
+    persist_credentials: Optional[bool] = True  # 是否直接保存凭证
+    proxy_url: Optional[str] = None  # 批量认证回调时可选代理
 
 
 class CredFileActionRequest(BaseModel):
@@ -395,6 +397,14 @@ class BatchGenerateLoginRequest(BaseModel):
     proxy_url: Optional[str] = None
     line_number: Optional[int] = None
     mode: Optional[str] = "geminicli"
+
+
+class GeneratedCredentialImportRequest(BaseModel):
+    mode: Optional[str] = "geminicli"
+    email: str
+    credential_data: Dict[str, Any]
+    project_id: Optional[str] = None
+    subscription_tier: Optional[str] = None
 
 
 class ConfigSaveRequest(BaseModel):

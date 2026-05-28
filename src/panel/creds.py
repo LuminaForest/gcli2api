@@ -10,15 +10,18 @@ import time
 import zipfile
 from typing import Any, List
 
+import config as app_config
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response
 from fastapi.responses import JSONResponse
 
 from log import log
+from src.auth import save_credentials
 from src.credential_manager import credential_manager
 from src.models import (
     CredFileActionRequest,
     CredFileBatchActionRequest,
     CredProxyBindRequest,
+    GeneratedCredentialImportRequest,
 )
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token, GEMINICLI_USER_AGENT, ANTIGRAVITY_USER_AGENT
@@ -28,7 +31,7 @@ from src.api.utils import (
     format_request_exception_message,
     is_proxy_request_exception,
 )
-from src.proxy_config import get_credential_proxy_request_kwargs
+from src.proxy_config import generate_proxy_url_from_generator, get_credential_proxy_request_kwargs
 from src.google_oauth_api import Credentials, fetch_project_id_and_tier
 from config import get_code_assist_endpoint, get_antigravity_api_url, get_proxy_pool_config
 from .utils import validate_mode
@@ -36,6 +39,7 @@ from .utils import validate_mode
 
 # 创建路由器
 router = APIRouter(prefix="/creds", tags=["credentials"])
+_GENERATED_PROXY_POOL_LOCK = asyncio.Lock()
 
 
 # =============================================================================
@@ -152,6 +156,151 @@ async def clear_all_model_cooldowns_for_credential(
             log.warning(f"清空模型CD失败或凭证不存在: {filename} (mode={mode})")
     except Exception as e:
         log.warning(f"清空模型CD时出错: {filename} (mode={mode}), error={e}")
+
+
+def _generated_management_label(mode: str) -> str:
+    return "AG凭证管理" if mode == "antigravity" else "GCLI凭证管理"
+
+
+def _sort_generated_proxy_pool(proxy_pool: list[dict[str, str]]) -> list[dict[str, str]]:
+    def sort_key(item: dict[str, str]):
+        name = str(item.get("name", ""))
+        if name.startswith("proxy_"):
+            suffix = name.removeprefix("proxy_")
+            if suffix.isdigit():
+                return (0, int(suffix), name)
+        return (1, 0, name)
+
+    return sorted(proxy_pool, key=sort_key)
+
+
+def _next_generated_proxy_pool_name(proxy_pool: list[dict[str, str]]) -> str:
+    max_seq = 0
+    for item in proxy_pool:
+        name = str((item or {}).get("name") or "").strip()
+        if not name.startswith("proxy_"):
+            continue
+        suffix = name.removeprefix("proxy_")
+        if suffix.isdigit():
+            max_seq = max(max_seq, int(suffix))
+    return f"proxy_{max_seq + 1}"
+
+
+async def _create_generated_proxy_pool_entry() -> dict[str, str]:
+    async with _GENERATED_PROXY_POOL_LOCK:
+        await app_config.reload_config()
+        generator_url = str(await app_config.get_credential_proxy_generator_url() or "").strip()
+        if not generator_url:
+            raise RuntimeError("未配置凭证代理生成链接，无法为新凭证创建专属代理")
+
+        storage_adapter = await get_storage_adapter()
+        proxy_pool = list(await app_config.get_proxy_pool_config())
+        proxy_name = _next_generated_proxy_pool_name(proxy_pool)
+        existing_urls = {str((item or {}).get("url") or "").strip() for item in proxy_pool}
+
+        proxy_url = ""
+        for attempt in range(3):
+            generated_url = await generate_proxy_url_from_generator(generator_url, scheme="http")
+            generated_url = str(generated_url or "").strip()
+            if generated_url and generated_url not in existing_urls:
+                proxy_url = generated_url
+                break
+            if generated_url:
+                log.warning(
+                    f"代理生成接口返回已存在的代理地址，正在重试: attempt={attempt + 1}, "
+                    f"proxy_name={proxy_name}"
+                )
+
+        if not proxy_url:
+            raise RuntimeError("生成新的专属代理失败，请检查凭证代理生成链接是否每次返回新代理")
+
+        updated_pool = _sort_generated_proxy_pool([*proxy_pool, {"name": proxy_name, "url": proxy_url}])
+        if not await storage_adapter.set_config("proxy_pool", updated_pool):
+            raise RuntimeError("保存新的代理池配置失败")
+
+        await app_config.reload_config()
+        return {"proxy_name": proxy_name, "proxy_url": proxy_url}
+
+
+async def import_generated_credential_common(
+    request: GeneratedCredentialImportRequest,
+) -> dict:
+    mode = validate_mode(request.mode or "geminicli")
+    management_label = _generated_management_label(mode)
+    credential_data = dict(request.credential_data or {})
+    email = str(request.email or "").strip()
+    project_id = str(request.project_id or credential_data.get("project_id") or "").strip()
+    subscription_tier = str(request.subscription_tier or "").strip() or None
+
+    if not email:
+        raise HTTPException(status_code=400, detail="邮箱不能为空")
+    if not credential_data:
+        raise HTTPException(status_code=400, detail="凭证数据不能为空")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="凭证缺少 project_id")
+
+    saved_filename = await save_credentials(
+        Credentials.from_dict(credential_data),
+        project_id,
+        mode=mode,
+        subscription_tier=subscription_tier,
+    )
+
+    storage_adapter = await get_storage_adapter()
+    updated = await storage_adapter.update_credential_state(
+        saved_filename,
+        {
+            "user_email": email,
+            "disabled": False,
+            "error_codes": [],
+            "error_messages": {},
+            **({"tier": subscription_tier} if subscription_tier else {}),
+        },
+        mode=mode,
+    )
+    if not updated:
+        raise RuntimeError(f"保存凭证状态失败: {saved_filename}")
+
+    proxy_info = await _create_generated_proxy_pool_entry()
+    updated = await storage_adapter.update_credential_state(
+        saved_filename,
+        {"proxy_name": proxy_info["proxy_name"], "user_email": email},
+        mode=mode,
+    )
+    if not updated:
+        raise RuntimeError(f"绑定专属代理失败: {saved_filename}")
+
+    preview_enabled = False
+    if mode == "geminicli":
+        preview_result = await configure_preview_channel_common(saved_filename, mode="geminicli")
+        if not preview_result.get("success"):
+            error_message = str(
+                preview_result.get("error") or preview_result.get("message") or "开启 Preview 失败"
+            )
+            raise RuntimeError(f"开启 Preview 失败: {error_message}")
+        preview_enabled = True
+
+    updated = await storage_adapter.update_credential_state(
+        saved_filename,
+        {"user_email": email},
+        mode=mode,
+    )
+    if not updated:
+        raise RuntimeError(f"写入账号邮箱失败: {saved_filename}")
+
+    log.info(
+        f"已导入独立批量生成凭证: filename={saved_filename}, "
+        f"mode={mode}, target={management_label}, email={email}, proxy={proxy_info['proxy_name']}"
+    )
+    return {
+        "success": True,
+        "filename": saved_filename,
+        "proxy_name": proxy_info["proxy_name"],
+        "proxy_url": proxy_info["proxy_url"],
+        "user_email": email,
+        "preview_enabled": preview_enabled,
+        "mode": mode,
+    }
 
 
 async def upload_credentials_common(
@@ -706,6 +855,22 @@ async def upload_credentials(
         raise
     except Exception as e:
         log.error(f"批量上传失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/import-generated")
+async def import_generated_credential(
+    request: GeneratedCredentialImportRequest,
+    token: str = Depends(verify_panel_token),
+):
+    """接收独立批量生成服务提交的凭证，并由原项目完成保存和代理绑定。"""
+    try:
+        result = await import_generated_credential_common(request)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"导入独立批量生成凭证失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

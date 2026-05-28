@@ -4,6 +4,7 @@ Batch generation panel routes.
 
 import config as app_config
 import asyncio
+import os
 import re
 import time
 import uuid
@@ -28,6 +29,7 @@ router = APIRouter(prefix="/batch-generate", tags=["batch-generate"])
 
 _LOGIN_TASKS: dict[str, dict] = {}
 _LOGIN_TASK_LOCK = Lock()
+_PROXY_POOL_LOCK = asyncio.Lock()
 _LOGIN_TASK_LIMIT = 50
 _LOGIN_TASK_LOG_LIMIT = 500
 _PAGE_LOAD_FAILURE_MARKERS = (
@@ -54,6 +56,18 @@ def _validate_email(email: str) -> bool:
 
 def _credential_management_label(mode: str) -> str:
     return "AG凭证管理" if mode == "antigravity" else "GCLI凭证管理"
+
+
+def _origin_base_url() -> str:
+    return str(os.getenv("GCLI2API_BASE_URL") or "").strip().rstrip("/")
+
+
+def _origin_panel_token() -> str:
+    return str(os.getenv("GCLI2API_PANEL_TOKEN") or "").strip()
+
+
+def _use_origin_import_api() -> bool:
+    return bool(_origin_base_url() and _origin_panel_token())
 
 
 def _cleanup_login_tasks_locked() -> None:
@@ -223,23 +237,110 @@ def _next_proxy_pool_name(proxy_pool: list[dict[str, str]]) -> str:
 
 
 async def _create_proxy_pool_entry() -> dict:
-    generator_url = str(await app_config.get_credential_proxy_generator_url() or "").strip()
-    if not generator_url:
-        raise RuntimeError("未配置凭证代理生成链接，无法为新凭证创建专属代理")
+    async with _PROXY_POOL_LOCK:
+        await app_config.reload_config()
+        generator_url = str(await app_config.get_credential_proxy_generator_url() or "").strip()
+        if not generator_url:
+            raise RuntimeError("未配置凭证代理生成链接，无法为新凭证创建专属代理")
 
-    storage_adapter = await get_storage_adapter()
-    proxy_pool = list(await app_config.get_proxy_pool_config())
-    proxy_name = _next_proxy_pool_name(proxy_pool)
-    proxy_url = await generate_proxy_url_from_generator(generator_url, scheme="http")
-    if not proxy_url:
-        raise RuntimeError("生成新的专属代理失败，请检查凭证代理生成链接")
+        storage_adapter = await get_storage_adapter()
+        proxy_pool = list(await app_config.get_proxy_pool_config())
+        proxy_name = _next_proxy_pool_name(proxy_pool)
+        existing_urls = {str((item or {}).get("url") or "").strip() for item in proxy_pool}
 
-    updated_pool = _sort_proxy_pool([*proxy_pool, {"name": proxy_name, "url": proxy_url}])
-    if not await storage_adapter.set_config("proxy_pool", updated_pool):
-        raise RuntimeError("保存新的代理池配置失败")
+        proxy_url = ""
+        for attempt in range(3):
+            generated_url = await generate_proxy_url_from_generator(generator_url, scheme="http")
+            generated_url = str(generated_url or "").strip()
+            if generated_url and generated_url not in existing_urls:
+                proxy_url = generated_url
+                break
+            if generated_url:
+                log.warning(
+                    f"代理生成接口返回已存在的代理地址，正在重试: attempt={attempt + 1}, "
+                    f"proxy_name={proxy_name}"
+                )
 
-    await app_config.reload_config()
-    return {"proxy_name": proxy_name, "proxy_url": proxy_url}
+        if not proxy_url:
+            raise RuntimeError("生成新的专属代理失败，请检查凭证代理生成链接是否每次返回新代理")
+
+        updated_pool = _sort_proxy_pool([*proxy_pool, {"name": proxy_name, "url": proxy_url}])
+        if not await storage_adapter.set_config("proxy_pool", updated_pool):
+            raise RuntimeError("保存新的代理池配置失败")
+
+        await app_config.reload_config()
+        return {"proxy_name": proxy_name, "proxy_url": proxy_url}
+
+
+async def _import_batch_generated_credential_to_origin(
+    result: dict,
+    email: str,
+    progress_logger,
+    mode: str,
+) -> dict:
+    import httpx
+
+    base_url = _origin_base_url()
+    panel_token = _origin_panel_token()
+    if not base_url or not panel_token:
+        raise RuntimeError("未配置远程服务地址或连接密码，无法回传凭证")
+
+    mode = validate_mode(mode)
+    management_label = _credential_management_label(mode)
+    credential_data = dict((result or {}).get("credentials") or {})
+    project_id = str((result or {}).get("project_id") or credential_data.get("project_id") or "").strip()
+    subscription_tier = str((result or {}).get("subscription_tier") or "").strip() or None
+    if not credential_data:
+        raise RuntimeError(f"临时凭证不存在，无法回传到原项目 {management_label}")
+    if not project_id:
+        raise RuntimeError(f"临时凭证缺少 project_id，无法回传到原项目 {management_label}")
+
+    progress_logger(f"gemini-2.5-flash 返回 200，正在回传凭证到原项目 {management_label}")
+    payload = {
+        "mode": mode,
+        "email": email,
+        "credential_data": credential_data,
+        "project_id": project_id,
+        "subscription_tier": subscription_tier,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{base_url}/creds/import-generated",
+                json=payload,
+                headers={"Authorization": f"Bearer {panel_token}"},
+            )
+    except Exception as exc:
+        raise RuntimeError(f"回传凭证到原项目失败: {exc}") from exc
+
+    try:
+        response_data = response.json()
+    except Exception:
+        response_data = {}
+
+    if response.status_code >= 400:
+        detail = response_data.get("detail") or response_data.get("error") or response.text
+        raise RuntimeError(f"原项目保存凭证失败: HTTP {response.status_code}, {detail}")
+
+    saved_filename = response_data.get("filename") or ""
+    if not saved_filename:
+        raise RuntimeError("原项目保存凭证失败: 响应缺少 filename")
+
+    progress_logger(f"原项目 {management_label} 已保存凭证: {saved_filename}")
+    if response_data.get("proxy_name"):
+        progress_logger(f"原项目已创建并绑定代理: {response_data['proxy_name']}")
+    if response_data.get("preview_enabled"):
+        progress_logger(f"原项目已开启 Preview: {saved_filename}")
+    progress_logger(f"原项目 {management_label} 已显示邮箱: {response_data.get('user_email') or email}")
+
+    return {
+        "filename": saved_filename,
+        "proxy_name": response_data.get("proxy_name") or "",
+        "proxy_url": response_data.get("proxy_url") or "",
+        "user_email": response_data.get("user_email") or email,
+        "preview_enabled": bool(response_data.get("preview_enabled")),
+    }
 
 
 async def _persist_batch_generated_credential(
@@ -248,6 +349,14 @@ async def _persist_batch_generated_credential(
     progress_logger,
     mode: str,
 ) -> dict:
+    if _use_origin_import_api():
+        return await _import_batch_generated_credential_to_origin(
+            result,
+            email,
+            progress_logger,
+            mode,
+        )
+
     mode = validate_mode(mode)
     management_label = _credential_management_label(mode)
     credential_data = dict((result or {}).get("credentials") or {})
@@ -434,7 +543,7 @@ async def _run_login_task(
         failure_reason = _classify_login_failure_reason("automation_failed", error)
         _set_login_task_failure(task_id, failure_reason, error)
         _append_login_task_log(task_id, f"后台登录任务失败: {error}", "error")
-        log.exception(f"[BATCH_GENERATE] 后台登录任务失败: email={email}")
+        log.error(f"[BATCH_GENERATE] 后台登录任务失败: email={email}, error={error}")
 
 
 @router.post("/login-first")
