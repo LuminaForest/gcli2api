@@ -394,6 +394,7 @@ class BatchGenerateLoginRequest(BaseModel):
     phone_code_url: Optional[str] = None
     proxy_url: Optional[str] = None
     line_number: Optional[int] = None
+    mode: Optional[str] = "geminicli"
 
 
 class ConfigSaveRequest(BaseModel):

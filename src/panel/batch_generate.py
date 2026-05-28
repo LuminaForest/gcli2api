@@ -21,6 +21,7 @@ from src.proxy_config import generate_proxy_url_from_generator
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token
 from .creds import configure_preview_channel_common
+from .utils import validate_mode
 
 
 router = APIRouter(prefix="/batch-generate", tags=["batch-generate"])
@@ -51,6 +52,10 @@ def _validate_email(email: str) -> bool:
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
 
 
+def _credential_management_label(mode: str) -> str:
+    return "AG凭证管理" if mode == "antigravity" else "GCLI凭证管理"
+
+
 def _cleanup_login_tasks_locked() -> None:
     if len(_LOGIN_TASKS) <= _LOGIN_TASK_LIMIT:
         return
@@ -60,13 +65,14 @@ def _cleanup_login_tasks_locked() -> None:
         _LOGIN_TASKS.pop(task_id, None)
 
 
-def _create_login_task(email: str) -> str:
+def _create_login_task(email: str, mode: str) -> str:
     task_id = uuid.uuid4().hex
     now = time.time()
     with _LOGIN_TASK_LOCK:
         _LOGIN_TASKS[task_id] = {
             "task_id": task_id,
             "email": email,
+            "mode": mode,
             "status": "queued",
             "account_unusable": False,
             "failure_reason": "",
@@ -240,20 +246,23 @@ async def _persist_batch_generated_credential(
     result: dict,
     email: str,
     progress_logger,
+    mode: str,
 ) -> dict:
+    mode = validate_mode(mode)
+    management_label = _credential_management_label(mode)
     credential_data = dict((result or {}).get("credentials") or {})
     project_id = str((result or {}).get("project_id") or credential_data.get("project_id") or "").strip()
     subscription_tier = str((result or {}).get("subscription_tier") or "").strip() or None
     if not credential_data:
-        raise RuntimeError("临时凭证不存在，无法保存到 GCLI凭证管理")
+        raise RuntimeError(f"临时凭证不存在，无法保存到 {management_label}")
     if not project_id:
-        raise RuntimeError("临时凭证缺少 project_id，无法保存到 GCLI凭证管理")
+        raise RuntimeError(f"临时凭证缺少 project_id，无法保存到 {management_label}")
 
-    progress_logger("gemini-2.5-flash 返回 200，正在保存凭证到 GCLI凭证管理")
+    progress_logger(f"gemini-2.5-flash 返回 200，正在保存凭证到 {management_label}")
     saved_filename = await save_credentials(
         Credentials.from_dict(credential_data),
         project_id,
-        mode="geminicli",
+        mode=mode,
         subscription_tier=subscription_tier,
     )
 
@@ -264,13 +273,14 @@ async def _persist_batch_generated_credential(
             "user_email": email,
             "disabled": False,
             "error_codes": [],
+            "error_messages": {},
             **({"tier": subscription_tier} if subscription_tier else {}),
         },
-        mode="geminicli",
+        mode=mode,
     )
     if not updated:
         raise RuntimeError(f"保存凭证状态失败: {saved_filename}")
-    progress_logger(f"凭证已保存到 GCLI凭证管理: {saved_filename}")
+    progress_logger(f"凭证已保存到 {management_label}: {saved_filename}")
 
     proxy_info = await _create_proxy_pool_entry()
     progress_logger(f"已在代理池创建新代理: {proxy_info['proxy_name']}")
@@ -278,33 +288,38 @@ async def _persist_batch_generated_credential(
     updated = await storage_adapter.update_credential_state(
         saved_filename,
         {"proxy_name": proxy_info["proxy_name"], "user_email": email},
-        mode="geminicli",
+        mode=mode,
     )
     if not updated:
         raise RuntimeError(f"绑定专属代理失败: {saved_filename}")
     progress_logger(f"已将代理 {proxy_info['proxy_name']} 绑定到凭证 {saved_filename}")
 
-    preview_result = await configure_preview_channel_common(saved_filename, mode="geminicli")
-    if not preview_result.get("success"):
-        error_message = str(preview_result.get("error") or preview_result.get("message") or "开启 Preview 失败")
-        raise RuntimeError(f"开启 Preview 失败: {error_message}")
-    progress_logger(f"Preview 已开启: {saved_filename}")
+    preview_enabled = False
+    if mode == "geminicli":
+        preview_result = await configure_preview_channel_common(saved_filename, mode="geminicli")
+        if not preview_result.get("success"):
+            error_message = str(preview_result.get("error") or preview_result.get("message") or "开启 Preview 失败")
+            raise RuntimeError(f"开启 Preview 失败: {error_message}")
+        preview_enabled = True
+        progress_logger(f"Preview 已开启: {saved_filename}")
+    else:
+        progress_logger(f"{management_label} 不需要开启 Preview，已跳过")
 
     updated = await storage_adapter.update_credential_state(
         saved_filename,
         {"user_email": email},
-        mode="geminicli",
+        mode=mode,
     )
     if not updated:
         raise RuntimeError(f"写入账号邮箱失败: {saved_filename}")
-    progress_logger(f"GCLI凭证管理已显示邮箱: {email}")
+    progress_logger(f"{management_label} 已显示邮箱: {email}")
 
     return {
         "filename": saved_filename,
         "proxy_name": proxy_info["proxy_name"],
         "proxy_url": proxy_info["proxy_url"],
         "user_email": email,
-        "preview_enabled": True,
+        "preview_enabled": preview_enabled,
     }
 
 
@@ -316,7 +331,11 @@ async def _run_login_task(
     phone: str,
     phone_code_url: str,
     proxy_url: str,
+    mode: str,
 ) -> None:
+    mode = validate_mode(mode)
+    management_label = _credential_management_label(mode)
+
     def progress_logger(message: str, level: str = "info") -> None:
         _append_login_task_log(task_id, message, level)
 
@@ -332,6 +351,7 @@ async def _run_login_task(
             phone=phone,
             phone_code_url=phone_code_url,
             proxy_url=proxy_url,
+            mode=mode,
             keep_open_seconds=3,
             progress_logger=progress_logger,
         )
@@ -380,24 +400,29 @@ async def _run_login_task(
         _set_login_task_test_result(task_id, test_info)
         if test_status_code == 200:
             try:
-                saved_result = await _persist_batch_generated_credential(result, email, progress_logger)
+                saved_result = await _persist_batch_generated_credential(result, email, progress_logger, mode=mode)
             except Exception as exc:
-                error = str(exc).strip() or "保存凭证到 GCLI凭证管理 失败"
+                error = str(exc).strip() or f"保存凭证到 {management_label} 失败"
                 _set_login_task_failure(task_id, "credential_persist_failed", error)
                 _append_login_task_log(task_id, f"后台登录任务失败: {error}", "error")
                 return
             _set_login_task_saved_credential(task_id, saved_result)
+            update_parts = [
+                f"filename={saved_result['filename']}",
+                f"proxy={saved_result['proxy_name']}",
+            ]
+            if saved_result.get("preview_enabled"):
+                update_parts.append("preview=ON")
+            update_parts.append(f"email={saved_result['user_email']}")
             _append_login_task_log(
                 task_id,
-                "GCLI凭证管理已更新: "
-                f"filename={saved_result['filename']}, proxy={saved_result['proxy_name']}, "
-                f"preview=ON, email={saved_result['user_email']}",
+                f"{management_label}已更新: " + ", ".join(update_parts),
             )
         else:
             _set_login_task_save_skipped(task_id, "model_test_not_200")
             _append_login_task_log(
                 task_id,
-                f"模型测试状态码为 {test_status_code or '-'}，跳过保存到 GCLI凭证管理",
+                f"模型测试状态码为 {test_status_code or '-'}，跳过保存到 {management_label}",
                 "warning",
             )
 
@@ -422,6 +447,7 @@ async def login_first_account(
     password = request.password
     line_number = max(1, int(request.line_number or 1))
     line_label = f"第{line_number}行"
+    mode = validate_mode(request.mode or "geminicli")
 
     if not _validate_email(email):
         raise HTTPException(status_code=400, detail=f"{line_label}邮箱格式不正确")
@@ -433,11 +459,12 @@ async def login_first_account(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    task_id = _create_login_task(email)
+    task_id = _create_login_task(email, mode)
     _append_login_task_log(task_id, f"已接收{line_label}账号登录任务: email={email}")
     _append_login_task_log(
         task_id,
         "任务参数: "
+        f"mode={mode}, "
         f"proxy={'enabled' if request.proxy_url else 'disabled'}, "
         f"2fa={'set' if request.two_fa_key else '-'}, "
         f"phone={'set' if request.phone else '-'}, "
@@ -453,12 +480,14 @@ async def login_first_account(
         phone=request.phone or "",
         phone_code_url=request.phone_code_url or "",
         proxy_url=request.proxy_url or "",
+        mode=mode,
     )
-    log.info(f"[BATCH_GENERATE] 已提交{line_label}账号登录任务: email={email}, task_id={task_id}")
+    log.info(f"[BATCH_GENERATE] 已提交{line_label}账号登录任务: email={email}, mode={mode}, task_id={task_id}")
     return JSONResponse(
         content={
             "message": f"已启动{line_label}账号登录流程: {email}",
             "task_id": task_id,
+            "mode": mode,
         }
     )
 
@@ -479,6 +508,7 @@ async def get_login_task_logs(
             "task_id": task_id,
             "status": task["status"],
             "email": task["email"],
+            "mode": task.get("mode") or "geminicli",
             "account_unusable": bool(task.get("account_unusable")),
             "failure_reason": task.get("failure_reason") or "",
             "error": task.get("failure_error") or "",

@@ -1,5 +1,5 @@
 """
-Browser automation helpers for batch GCLI credential generation.
+Browser automation helpers for batch credential generation.
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse,
 import httpx
 
 from log import log
-from src.utils import GEMINICLI_USER_AGENT
+from src.utils import ANTIGRAVITY_USER_AGENT, GEMINICLI_USER_AGENT
 
 
 ProgressLogger = Callable[[str, str], None]
@@ -38,6 +38,16 @@ _2FA_BYPASS_URL = (
 _GOOGLE_ENGLISH_PARAMS = {"hl": "en", "gl": "US", "lr": "lang_en"}
 _PHONE_CODE_PATTERN = re.compile(r"\bG\s*[-:：]\s*([0-9A-Za-z]{4,12})\b", re.IGNORECASE)
 _PHONE_RATE_LIMIT_SENTINEL = "__PHONE_RATE_LIMITED__"
+
+
+def _normalize_credential_mode(mode: str) -> str:
+    return "antigravity" if str(mode or "").strip() == "antigravity" else "geminicli"
+
+
+def _credential_mode_label(mode: str) -> str:
+    return "Antigravity" if _normalize_credential_mode(mode) == "antigravity" else "GCLI"
+
+
 _PHONE_RATE_LIMIT_MARKERS = (
     "too many failed attempts",
     "too many attempts",
@@ -2894,17 +2904,33 @@ def _handle_validation_url(
 async def _test_cached_gemini_credential(
     credential_data: dict,
     proxy_url: str,
+    mode: str = "geminicli",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
-    from config import get_code_assist_endpoint
+    from config import get_antigravity_api_url, get_code_assist_endpoint
     from src.httpx_client import _extract_httpx_error_message, post_async
 
+    mode = _normalize_credential_mode(mode)
+    mode_label = _credential_mode_label(mode)
     access_token = credential_data.get("access_token") or credential_data.get("token")
     project_id = credential_data.get("project_id")
-    api_base_url = await get_code_assist_endpoint()
+    test_model = "gemini-2.5-flash"
+
+    if mode == "antigravity":
+        from src.api.antigravity import build_antigravity_headers
+
+        api_base_url = await get_antigravity_api_url()
+        headers = build_antigravity_headers(access_token, test_model)
+    else:
+        api_base_url = await get_code_assist_endpoint()
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": GEMINICLI_USER_AGENT,
+        }
 
     _emit_progress(
-        f"正在使用临时凭证测试 gemini-2.5-flash: project_id={project_id}",
+        f"正在使用临时{mode_label}凭证测试 {test_model}: project_id={project_id}",
         progress_logger=progress_logger,
     )
 
@@ -2912,25 +2938,21 @@ async def _test_cached_gemini_credential(
         response = await post_async(
             url=f"{api_base_url}/v1internal:generateContent",
             json={
-                "model": "gemini-2.5-flash",
+                "model": test_model,
                 "project": project_id,
                 "request": {
                     "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
                     "generationConfig": {"maxOutputTokens": 1},
                 },
             },
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                "User-Agent": GEMINICLI_USER_AGENT,
-            },
+            headers=headers,
             timeout=30.0,
-            **_build_batch_proxy_kwargs(proxy_url, "batch_generate_credential_test"),
+            **_build_batch_proxy_kwargs(proxy_url, f"batch_generate_{mode}_credential_test"),
         )
     except Exception as exc:
         error_detail = _extract_httpx_error_message(exc)
         log.warning(
-            "[BATCH_GENERATE] gemini-2.5-flash 测试请求异常: "
+            f"[BATCH_GENERATE] {mode_label} {test_model} 测试请求异常: "
             f"project_id={project_id}, error_type={type(exc).__name__}, error={error_detail}"
         )
         raise RuntimeError(f"{type(exc).__name__}: {error_detail}") from exc
@@ -2943,7 +2965,7 @@ async def _test_cached_gemini_credential(
 
     response_summary = _summarize_http_response_body(response_text, response_data)
     log.info(
-        "[BATCH_GENERATE] gemini-2.5-flash 测试返回: "
+        f"[BATCH_GENERATE] {mode_label} {test_model} 测试返回: "
         f"project_id={project_id}, status_code={response.status_code}, body={response_summary}"
     )
 
@@ -2951,18 +2973,18 @@ async def _test_cached_gemini_credential(
     success = response.status_code in (200, 429)
     if success:
         _emit_progress(
-            f"gemini-2.5-flash 测试通过: HTTP {response.status_code}",
+            f"{test_model} 测试通过: HTTP {response.status_code}",
             progress_logger=progress_logger,
         )
     elif validation_url:
         _emit_progress(
-            "gemini-2.5-flash 返回账号验证要求，已解析 validation_url",
+            f"{test_model} 返回账号验证要求，已解析 validation_url",
             level="warning",
             progress_logger=progress_logger,
         )
     else:
         _emit_progress(
-            f"gemini-2.5-flash 测试失败: HTTP {response.status_code}, body={response_text[:500]}",
+            f"{test_model} 测试失败: HTTP {response.status_code}, body={response_text[:500]}",
             level="warning",
             progress_logger=progress_logger,
         )
@@ -2978,6 +3000,7 @@ async def _test_cached_gemini_credential(
 async def _build_cached_credential_from_callback_url(
     callback_url: str,
     proxy_url: str,
+    mode: str = "geminicli",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
     from src.auth import (
@@ -2986,9 +3009,10 @@ async def _build_cached_credential_from_callback_url(
         _prepare_credentials_data,
         auth_flows,
     )
-    from config import get_code_assist_endpoint
+    from config import get_antigravity_api_url, get_code_assist_endpoint
     from src.google_oauth_api import fetch_project_id_and_tier
 
+    mode = _normalize_credential_mode(mode)
     callback_query = parse_qs(urlparse(callback_url).query)
     state = callback_query.get("state", [""])[0]
     parsed = _parse_callback_code_from_url(callback_url, state)
@@ -3000,6 +3024,8 @@ async def _build_cached_credential_from_callback_url(
     if not flow_data:
         raise RuntimeError(f"未找到OAuth授权流程: state={state}")
 
+    mode = _normalize_credential_mode(flow_data.get("mode") or mode)
+    mode_label = _credential_mode_label(mode)
     flow = flow_data["flow"]
     subscription_tier = None
     project_id = None
@@ -3013,13 +3039,20 @@ async def _build_cached_credential_from_callback_url(
         _emit_progress("OAuth访问令牌获取成功", progress_logger=progress_logger)
 
         try:
-            _emit_progress("正在从Code Assist接口检测 project_id", progress_logger=progress_logger)
-            api_base_url = await get_code_assist_endpoint()
+            if mode == "antigravity":
+                _emit_progress("正在从Antigravity接口检测 project_id", progress_logger=progress_logger)
+                api_base_url = await get_antigravity_api_url()
+                user_agent = ANTIGRAVITY_USER_AGENT
+            else:
+                _emit_progress("正在从Code Assist接口检测 project_id", progress_logger=progress_logger)
+                api_base_url = await get_code_assist_endpoint()
+                user_agent = GEMINICLI_USER_AGENT
+
             project_id, subscription_tier = await fetch_project_id_and_tier(
                 credentials.access_token,
-                GEMINICLI_USER_AGENT,
+                user_agent,
                 api_base_url,
-                proxy_kwargs=_build_batch_proxy_kwargs(proxy_url, "batch_generate_project_detect"),
+                proxy_kwargs=_build_batch_proxy_kwargs(proxy_url, f"batch_generate_{mode}_project_detect"),
             )
         except Exception as exc:
             _emit_progress(
@@ -3044,14 +3077,15 @@ async def _build_cached_credential_from_callback_url(
         credential_data = _prepare_credentials_data(
             credentials,
             project_id,
-            mode="geminicli",
+            mode=mode,
             subscription_tier=subscription_tier,
         )
-        _emit_progress("临时凭证已生成并保存在内存缓存中", progress_logger=progress_logger)
+        _emit_progress(f"临时{mode_label}凭证已生成并保存在内存缓存中", progress_logger=progress_logger)
 
         test_result = await _test_cached_gemini_credential(
             credential_data,
             proxy_url,
+            mode=mode,
             progress_logger=progress_logger,
         )
 
@@ -3073,12 +3107,15 @@ def _authorize_logged_in_account_and_test(
     phone: str,
     phone_code_url: str,
     proxy_url: str,
+    mode: str = "geminicli",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
     from src.auth import _cleanup_auth_flow_server, create_auth_url
 
-    _emit_progress("正在生成GCLI OAuth授权链接", progress_logger=progress_logger)
-    auth_result = _run_async(create_auth_url(user_session="batch_generate", mode="geminicli"))
+    mode = _normalize_credential_mode(mode)
+    mode_label = _credential_mode_label(mode)
+    _emit_progress(f"正在生成{mode_label} OAuth授权链接", progress_logger=progress_logger)
+    auth_result = _run_async(create_auth_url(user_session="batch_generate", mode=mode))
     if not auth_result.get("success"):
         raise RuntimeError(auth_result.get("error") or "生成OAuth授权链接失败")
 
@@ -3109,6 +3146,7 @@ def _authorize_logged_in_account_and_test(
             _build_cached_credential_from_callback_url(
                 callback_url,
                 proxy_url,
+                mode=mode,
                 progress_logger=progress_logger,
             )
         )
@@ -3150,6 +3188,7 @@ def _authorize_logged_in_account_and_test(
                 _test_cached_gemini_credential(
                     result["credentials"],
                     proxy_url,
+                    mode=mode,
                     progress_logger=progress_logger,
                 )
             )
@@ -3454,9 +3493,12 @@ def run_google_login(
     phone: str = "",
     phone_code_url: str = "",
     proxy_url: str = "",
+    mode: str = "geminicli",
     keep_open_seconds: int = 600,
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
+    mode = _normalize_credential_mode(mode)
+    mode_label = _credential_mode_label(mode)
     _emit_progress("正在检查浏览器自动化依赖", progress_logger=progress_logger)
     ensure_browser_automation_available()
 
@@ -3471,7 +3513,7 @@ def run_google_login(
     )
 
     _emit_progress(
-        f"启动Chrome无痕登录: email={email}, "
+        f"启动Chrome无痕登录并生成{mode_label}凭证: email={email}, "
         f"proxy={'enabled' if proxy else 'disabled'}, phone={'set' if phone else '-'}, "
         f"phone_code_url={'set' if phone_code_url else '-'}, "
         f"2fa={'set' if two_fa_key else '-'}",
@@ -3585,6 +3627,7 @@ def run_google_login(
                 phone=phone,
                 phone_code_url=phone_code_url,
                 proxy_url=proxy_url,
+                mode=mode,
                 progress_logger=progress_logger,
             )
             if (result or {}).get("account_unusable"):

@@ -1,5 +1,5 @@
 // =====================================================================
-// 批量生成 GCLI 凭证文件
+// 批量生成凭证文件
 // =====================================================================
 
 (function() {
@@ -17,7 +17,25 @@
         accounts: [],
         failedAccounts: [],
         existingCredentialEmails: new Set(),
+        activeMode: 'geminicli',
         isBatchRunning: false
+    };
+
+    const MODE_CONFIG = {
+        geminicli: {
+            mode: 'geminicli',
+            credentialLabel: 'GCLI凭证',
+            managementLabel: 'GCLI凭证管理',
+            startButtonId: 'batchGenerateGcliStartBtn',
+            startButtonText: '开始生成GCLI凭证'
+        },
+        antigravity: {
+            mode: 'antigravity',
+            credentialLabel: 'Antigravity凭证',
+            managementLabel: 'AG凭证管理',
+            startButtonId: 'batchGenerateAntigravityStartBtn',
+            startButtonText: '开始生成Antigravity'
+        }
     };
 
     function getElement(id) {
@@ -109,6 +127,14 @@
         return String(value || '').trim().toLowerCase();
     }
 
+    function normalizeMode(mode) {
+        return mode === 'antigravity' ? 'antigravity' : 'geminicli';
+    }
+
+    function getModeConfig(mode) {
+        return MODE_CONFIG[normalizeMode(mode)];
+    }
+
     function isPageLoadFailure(result) {
         const reason = getFailureReason(result);
         const retryableReasons = new Set([
@@ -158,11 +184,13 @@
             .join('，');
     }
 
-    function setStartButtonDisabled(disabled) {
-        const button = getElement('batchGenerateStartBtn');
-        if (!button) return;
-        button.disabled = Boolean(disabled);
-        button.textContent = disabled ? '生成中...' : '开始生成';
+    function setStartButtonsDisabled(disabled, activeMode = state.activeMode) {
+        Object.values(MODE_CONFIG).forEach(config => {
+            const button = getElement(config.startButtonId);
+            if (!button) return;
+            button.disabled = Boolean(disabled);
+            button.textContent = disabled && config.mode === activeMode ? '生成中...' : config.startButtonText;
+        });
     }
 
     function stopLogPolling() {
@@ -406,7 +434,8 @@
         };
     }
 
-    async function submitAccount(account, index, total) {
+    async function submitAccount(account, index, total, mode) {
+        const config = getModeConfig(mode);
         if (!state.currentProxyUrl) {
             appendLog('当前没有代理地址，正在自动生成代理地址...');
             await generateAndSaveProxy({ auto: true });
@@ -416,12 +445,13 @@
         }
 
         appendLog(`将使用代理地址提交登录任务: ${state.currentProxyUrl}`);
-        appendLog(`正在提交第 ${index + 1}/${total} 行账号到后台自动化任务...`);
+        appendLog(`正在提交第 ${index + 1}/${total} 行账号到后台自动化任务，目标: ${config.managementLabel}`);
         const response = await fetch('./batch-generate/login-first', {
             method: 'POST',
             headers: getAuthHeaderValues(),
             body: JSON.stringify({
                 ...account,
+                mode: config.mode,
                 proxy_url: state.currentProxyUrl || ''
             })
         });
@@ -454,7 +484,8 @@
         return true;
     }
 
-    async function refreshCredentialManagementState() {
+    async function refreshCredentialManagementState(mode) {
+        const config = getModeConfig(mode);
         try {
             const response = await fetch('./config/get', { headers: getAuthHeaderValues() });
             const data = await response.json();
@@ -470,16 +501,20 @@
             appendLog(`静默刷新代理池配置失败: ${error.message}`);
         }
 
-        if (typeof AppState !== 'undefined' && AppState.creds && typeof AppState.creds.refresh === 'function') {
+        const manager = config.mode === 'antigravity'
+            ? (typeof AppState !== 'undefined' ? AppState.antigravityCreds : null)
+            : (typeof AppState !== 'undefined' ? AppState.creds : null);
+        if (manager && typeof manager.refresh === 'function') {
             try {
-                await AppState.creds.refresh();
+                await manager.refresh();
             } catch (error) {
-                appendLog(`静默刷新GCLI凭证管理失败: ${error.message}`);
+                appendLog(`静默刷新${config.managementLabel}失败: ${error.message}`);
             }
         }
     }
 
-    async function loadExistingCredentialEmails() {
+    async function loadExistingCredentialEmails(mode) {
+        const config = getModeConfig(mode);
         const emails = new Set();
         let offset = 0;
         const limit = 1000;
@@ -488,12 +523,12 @@
         while (guard < 50) {
             guard += 1;
             const response = await fetch(
-                `./creds/status?offset=${offset}&limit=${limit}&status_filter=all&error_code_filter=all&cooldown_filter=all&preview_filter=all&tier_filter=all&mode=geminicli`,
+                `./creds/status?offset=${offset}&limit=${limit}&status_filter=all&error_code_filter=all&cooldown_filter=all&preview_filter=all&tier_filter=all&mode=${config.mode}`,
                 { headers: getAuthHeaderValues() }
             );
             const data = await response.json();
             if (!response.ok) {
-                throw new Error(data.detail || data.error || '加载GCLI凭证管理邮箱失败');
+                throw new Error(data.detail || data.error || `加载${config.managementLabel}邮箱失败`);
             }
 
             (data.items || []).forEach(item => {
@@ -508,11 +543,13 @@
         return emails;
     }
 
-    async function processAccounts(accounts) {
+    async function processAccounts(accounts, mode) {
+        const config = getModeConfig(mode);
+        state.activeMode = config.mode;
         state.accounts = accounts;
         state.failedAccounts = [];
         state.isBatchRunning = true;
-        setStartButtonDisabled(true);
+        setStartButtonsDisabled(true, config.mode);
 
         let unusableCount = 0;
         let failedCount = 0;
@@ -521,8 +558,8 @@
         let skippedCount = 0;
 
         try {
-            appendLog('正在查询 GCLI凭证管理 中已存在的邮箱...');
-            state.existingCredentialEmails = await loadExistingCredentialEmails();
+            appendLog(`正在查询 ${config.managementLabel} 中已存在的邮箱...`);
+            state.existingCredentialEmails = await loadExistingCredentialEmails(config.mode);
             appendLog(`已加载 ${state.existingCredentialEmails.size} 个已有邮箱，用于跳过重复账号`);
 
             for (let index = 0; index < accounts.length; index += 1) {
@@ -532,7 +569,7 @@
                 const normalizedEmail = normalizeEmail(account.email);
                 if (normalizedEmail && state.existingCredentialEmails.has(normalizedEmail)) {
                     skippedCount += 1;
-                    const skippedMessage = `第 ${account.line_number} 行账号 ${account.email} 已存在于 GCLI凭证管理，跳过`;
+                    const skippedMessage = `第 ${account.line_number} 行账号 ${account.email} 已存在于 ${config.managementLabel}，跳过`;
                     setAccountStatus(skippedMessage, 'warning');
                     appendLog(skippedMessage);
                     continue;
@@ -549,7 +586,7 @@
                     let taskResult = null;
                     const maxProxyRetries = 1;
                     for (let attempt = 0; attempt <= maxProxyRetries; attempt += 1) {
-                        taskResult = await submitAccount(account, index, accounts.length);
+                        taskResult = await submitAccount(account, index, accounts.length, config.mode);
                         if (
                             taskResult &&
                             taskResult.status === 'failed' &&
@@ -584,7 +621,7 @@
                             savedCount += 1;
                             const savedEmail = normalizeEmail(taskResult.saved_user_email || account.email);
                             if (savedEmail) state.existingCredentialEmails.add(savedEmail);
-                            await refreshCredentialManagementState();
+                            await refreshCredentialManagementState(config.mode);
                             const savedParts = [];
                             if (taskResult.saved_credential_filename) savedParts.push(`凭证=${taskResult.saved_credential_filename}`);
                             if (taskResult.saved_proxy_name) savedParts.push(`代理=${taskResult.saved_proxy_name}`);
@@ -638,7 +675,7 @@
             );
         } finally {
             state.isBatchRunning = false;
-            setStartButtonDisabled(false);
+            setStartButtonsDisabled(false, config.mode);
             state.activeTaskId = '';
             state.activeTaskDone = null;
         }
@@ -725,6 +762,7 @@
     function clearFile() {
         stopLogPolling();
         state.isBatchRunning = false;
+        state.activeMode = 'geminicli';
         state.activeTaskId = '';
         state.activeTaskDone = null;
         state.lastTaskLogSeq = 0;
@@ -734,10 +772,18 @@
         const input = getElement('batchGenerateFileInput');
         if (input) input.value = '';
         updateFileList();
+        setStartButtonsDisabled(false);
         setAccountStatus('');
     }
 
-    function start() {
+    function start(mode = 'geminicli') {
+        const config = getModeConfig(mode);
+        if (state.isBatchRunning) {
+            showStatus('当前已有批量生成任务正在运行', 'warning');
+            return;
+        }
+
+        state.activeMode = config.mode;
         stopLogPolling();
         state.activeTaskId = '';
         state.activeTaskDone = null;
@@ -746,7 +792,7 @@
 
         if (!state.selectedFile) {
             showStatus('请先上传txt文件', 'error');
-            appendLog('未选择txt文件，无法开始生成', true);
+            appendLog(`未选择txt文件，无法开始生成${config.credentialLabel}`, true);
             return;
         }
 
@@ -765,7 +811,7 @@
 
             try {
                 const accounts = [];
-                appendLog(`读取到 ${lines.length} 行有效文本，开始解析账号`, true);
+                appendLog(`读取到 ${lines.length} 行有效文本，开始解析账号，目标: ${config.managementLabel}`, true);
                 lines.forEach((line, index) => {
                     try {
                         accounts.push(parseAccountLine(line, index + 1));
@@ -780,9 +826,9 @@
                     return;
                 }
 
-                appendLog(`解析到 ${accounts.length} 个可用账号，将按行顺序逐个处理`);
-                showStatus('已解析账号，开始按行处理', 'success');
-                await processAccounts(accounts);
+                appendLog(`解析到 ${accounts.length} 个可用账号，将按行顺序逐个生成${config.credentialLabel}`);
+                showStatus(`已解析账号，开始生成${config.credentialLabel}`, 'success');
+                await processAccounts(accounts, config.mode);
             } catch (error) {
                 appendLog(`启动失败: ${error.message}`);
                 setAccountStatus(`启动失败: ${error.message}`, 'error');
@@ -804,6 +850,8 @@
         handleDragOver,
         handleDragLeave,
         clearFile,
-        start
+        start,
+        startGcli: () => start('geminicli'),
+        startAntigravity: () => start('antigravity')
     };
 })();
