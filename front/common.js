@@ -1405,22 +1405,25 @@ function updateTabSlider(targetTab, animate = true) {
     const tabs = document.querySelector('.tabs');
     if (!slider || !tabs || !targetTab) return;
 
-    // 获取按钮位置和容器宽度
-    const tabLeft = targetTab.offsetLeft;
-    const tabWidth = targetTab.offsetWidth;
-    const tabsWidth = tabs.scrollWidth;
-
-    // 使用 left 和 right 同时控制，确保动画同步
-    const rightValue = tabsWidth - tabLeft - tabWidth;
+    // 滑块使用滚动内容坐标定位，避免横向滚动时把 scrollWidth 当成可视宽度计算。
+    const tabsRect = tabs.getBoundingClientRect();
+    const tabRect = targetTab.getBoundingClientRect();
+    const tabLeft = tabRect.left - tabsRect.left + tabs.scrollLeft;
+    const tabWidth = tabRect.width;
+    const applyPosition = () => {
+        slider.style.left = '0px';
+        slider.style.right = 'auto';
+        slider.style.width = `${tabWidth}px`;
+        slider.style.transform = `translateX(${tabLeft}px)`;
+    };
 
     if (animate) {
-        slider.style.left = `${tabLeft}px`;
-        slider.style.right = `${rightValue}px`;
+        applyPosition();
+        targetTab.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
     } else {
         // 首次加载时不使用动画
         slider.style.transition = 'none';
-        slider.style.left = `${tabLeft}px`;
-        slider.style.right = `${rightValue}px`;
+        applyPosition();
         // 强制重绘后恢复过渡
         slider.offsetHeight;
         slider.style.transition = '';
@@ -1442,17 +1445,21 @@ window.addEventListener('resize', () => {
     if (activeTab) updateTabSlider(activeTab, false);
 });
 
-function switchTab(tabName) {
+function switchTab(tabName, event) {
     // 获取当前活动的内容区域
     const currentContent = document.querySelector('.tab-content.active');
     const targetContent = document.getElementById(tabName + 'Tab');
 
-    // 如果点击的是当前标签页，不做任何操作
-    if (currentContent === targetContent) return;
-
     // 找到目标标签按钮
-    const targetTab = event && event.target ? event.target :
-        document.querySelector(`.tab[onclick*="'${tabName}'"]`);
+    const targetTab = event && event.target
+        ? event.target.closest('.tab')
+        : document.querySelector(`.tab[onclick*="'${tabName}'"]`);
+
+    // 如果点击的是当前标签页，不做任何操作
+    if (currentContent === targetContent) {
+        if (targetTab) updateTabSlider(targetTab, true);
+        return;
+    }
 
     // 移除所有标签页的active状态
     document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
