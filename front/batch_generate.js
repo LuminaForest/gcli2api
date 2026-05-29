@@ -117,6 +117,7 @@
             phone_option_missing: '未提供 Verify your phone number，账号不可用',
             phone_rate_limited: '当前手机号异常，已被用于验证过多次',
             service_unavailable: '页面提示 Entire service unavailable，账号不可用',
+            recover_account_required: '页面提示 Recover account，账号不可用',
             open_failed: '打开验证页失败',
             code_fetch_failed: '获取短信验证码失败',
             code_submit_failed: '提交短信验证码失败',

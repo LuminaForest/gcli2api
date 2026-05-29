@@ -477,6 +477,8 @@ async def _run_login_task(
                 unusable_message = "当前手机号异常：This phone number has already been used too many times for verification"
             elif validation_status == "service_unavailable":
                 unusable_message = "页面提示 Entire service unavailable，该账号不可用"
+            elif validation_status == "recover_account_required":
+                unusable_message = "页面提示 Recover account，该账号不可用"
             _append_login_task_log(task_id, f"{unusable_message}，准备处理下一行账号", "error")
             with _LOGIN_TASK_LOCK:
                 task = _LOGIN_TASKS.get(task_id)
