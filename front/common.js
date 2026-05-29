@@ -1150,16 +1150,16 @@ function createCredCard(credInfo, manager) {
     const missingProxyOption = boundProxyName && !proxyPool.some(proxy => proxy.name === boundProxyName)
         ? `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${escapeHtml(boundProxyName)}" style="padding: 6px 10px; border: none; background: transparent; text-align: left; cursor: pointer; color: #c62828;">${escapeHtml(boundProxyName)}（不存在）</button>`
         : '';
-    const proxyOptions = `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="" style="padding: 6px 10px; border: none; background: ${boundProxyName ? 'transparent' : '#e8f0fe'}; text-align: left; cursor: pointer;">继承全局代理</button>` + missingProxyOption + proxyPool.map(proxy => {
-        const selectedStyle = proxy.name === boundProxyName ? 'background: #e8f0fe;' : 'background: transparent;';
+    const availableProxyPool = proxyPool.filter(proxy => getProxyBindings(proxy.name).length === 0);
+    const emptyProxyOption = availableProxyPool.length
+        ? ''
+        : '<span style="padding: 6px 10px; color: #6b7280; font-size: 12px;">暂无未绑定代理</span>';
+    const proxyOptions = `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="" style="padding: 6px 10px; border: none; background: ${boundProxyName ? 'transparent' : '#e8f0fe'}; text-align: left; cursor: pointer;">继承全局代理</button>` + missingProxyOption + emptyProxyOption + availableProxyPool.map(proxy => {
         const name = escapeHtml(proxy.name);
         const title = escapeHtml(maskProxyUrl(proxy.url));
-        const bindings = getProxyBindings(proxy.name);
-        const bindingText = bindings.length > 0 ? `已绑定 ${bindings.length}` : '未绑定';
-        const bindingColor = bindings.length > 0 ? '#1a73e8' : '#607d8b';
-        return `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${name}" title="${title}" style="display: flex; justify-content: space-between; gap: 12px; padding: 6px 10px; border: none; ${selectedStyle} text-align: left; cursor: pointer;">
+        return `<button type="button" data-proxy-bind data-filename="${escapeHtml(filename)}" data-proxy-name="${name}" title="${title}" style="display: flex; justify-content: space-between; gap: 12px; padding: 6px 10px; border: none; background: transparent; text-align: left; cursor: pointer;">
             <span>${name}</span>
-            <span style="color: ${bindingColor}; font-size: 11px; white-space: nowrap;">${bindingText}</span>
+            <span style="color: #607d8b; font-size: 11px; white-space: nowrap;">未绑定</span>
         </button>`;
     }).join('');
     const proxySelector = `
