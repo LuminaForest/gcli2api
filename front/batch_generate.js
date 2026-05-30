@@ -4,6 +4,7 @@
 
 (function() {
     const BATCH_PROXY_CONFIG_KEY = 'batch_generate_proxy_url';
+    const BATCH_PAGE_LOAD_PROXY_MAX_RETRIES = 5;
 
     const state = {
         selectedFile: null,
@@ -20,18 +21,11 @@
         accounts: [],
         failedAccounts: [],
         existingCredentialEmails: new Set(),
-        activeMode: 'geminicli',
+        activeMode: 'antigravity',
         isBatchRunning: false
     };
 
     const MODE_CONFIG = {
-        geminicli: {
-            mode: 'geminicli',
-            credentialLabel: 'GCLI凭证',
-            managementLabel: 'GCLI凭证管理',
-            startButtonId: 'batchGenerateGcliStartBtn',
-            startButtonText: '开始生成GCLI凭证'
-        },
         antigravity: {
             mode: 'antigravity',
             credentialLabel: 'Antigravity凭证',
@@ -116,8 +110,10 @@
             validation_failed: '账号验证未完成',
             phone_option_missing: '未提供 Verify your phone number，账号不可用',
             phone_rate_limited: '当前手机号异常，已被用于验证过多次',
+            phone_number_unusable: '当前手机号异常，不能用于验证',
             service_unavailable: '页面提示 Entire service unavailable，账号不可用',
             recover_account_required: '页面提示 Recover account，账号不可用',
+            email_phone_already_bound: '登录提交后复查页出现 Send 按钮，该邮箱已绑定手机',
             open_failed: '打开验证页失败',
             code_fetch_failed: '获取短信验证码失败',
             code_submit_failed: '提交短信验证码失败',
@@ -135,6 +131,10 @@
         return labels[value] || value;
     }
 
+    function formatDisplayText(text) {
+        return String(text || '').replaceAll('phone_number_unusable', formatFailureReason('phone_number_unusable'));
+    }
+
     function getFailureReason(result) {
         return String(result?.failure_reason || result?.status || result?.error || '').trim();
     }
@@ -148,7 +148,7 @@
     }
 
     function normalizeMode(mode) {
-        return mode === 'antigravity' ? 'antigravity' : 'geminicli';
+        return 'antigravity';
     }
 
     function getModeConfig(mode) {
@@ -243,7 +243,7 @@
             const prefix = log.level === 'warning'
                 ? '警告: '
                 : (log.level === 'error' ? '错误: ' : '');
-            appendLog(`${prefix}${log.message}`);
+            appendLog(`${prefix}${formatDisplayText(log.message)}`);
         });
     }
 
@@ -688,7 +688,7 @@
 
                 try {
                     let taskResult = null;
-                    const maxProxyRetries = 1;
+                    const maxProxyRetries = BATCH_PAGE_LOAD_PROXY_MAX_RETRIES;
                     for (let attempt = 0; attempt <= maxProxyRetries; attempt += 1) {
                         taskResult = await submitAccount(account, index, accounts.length, config.mode);
                         if (
@@ -710,9 +710,11 @@
                         recordFailedAccount(account, failureReason);
                         const message = failureReason === 'phone_rate_limited'
                             ? `第 ${account.line_number} 行账号 ${account.email} 当前手机号异常，已关闭无痕Chrome，继续处理下一行`
+                            : (failureReason === 'phone_number_unusable'
+                                ? `第 ${account.line_number} 行账号 ${account.email} 当前手机号不能用于验证，已关闭无痕Chrome，继续处理下一行`
                             : (failureReason === 'service_unavailable'
                                 ? `第 ${account.line_number} 行账号 ${account.email} 页面提示 Entire service unavailable，已关闭无痕Chrome，继续处理下一行`
-                                : `第 ${account.line_number} 行账号 ${account.email} 不可用（${reasonText}），已关闭无痕Chrome，继续处理下一行`);
+                                : `第 ${account.line_number} 行账号 ${account.email} 不可用（${reasonText}），已关闭无痕Chrome，继续处理下一行`));
                         setAccountStatus(message, 'error');
                         appendLog(message);
                         continue;
@@ -729,7 +731,6 @@
                             const savedParts = [];
                             if (taskResult.saved_credential_filename) savedParts.push(`凭证=${taskResult.saved_credential_filename}`);
                             if (taskResult.saved_proxy_name) savedParts.push(`代理=${taskResult.saved_proxy_name}`);
-                            if (taskResult.saved_preview_enabled) savedParts.push('Preview=ON');
                             if (taskResult.saved_user_email) savedParts.push(`邮箱=${taskResult.saved_user_email}`);
                             const savedSuffix = savedParts.length ? `，${savedParts.join('，')}` : '';
                             const completedMessage = `第 ${account.line_number} 行账号 ${account.email} 已处理完成${savedSuffix}`;
@@ -872,7 +873,7 @@
     function clearFile() {
         stopLogPolling();
         state.isBatchRunning = false;
-        state.activeMode = 'geminicli';
+        state.activeMode = 'antigravity';
         state.activeTaskId = '';
         state.activeTaskDone = null;
         state.lastTaskLogSeq = 0;
@@ -889,7 +890,7 @@
         setAccountStatus('');
     }
 
-    function start(mode = 'geminicli') {
+    function start(mode = 'antigravity') {
         const config = getModeConfig(mode);
         if (state.isBatchRunning) {
             setBatchStatus('当前已有批量生成任务正在运行', 'warning');
@@ -967,7 +968,6 @@
         handleDragLeave,
         clearFile,
         start,
-        startGcli: () => start('geminicli'),
         startAntigravity: () => start('antigravity')
     };
 })();

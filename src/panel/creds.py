@@ -225,7 +225,9 @@ async def _create_generated_proxy_pool_entry() -> dict[str, str]:
 async def import_generated_credential_common(
     request: GeneratedCredentialImportRequest,
 ) -> dict:
-    mode = validate_mode(request.mode or "geminicli")
+    mode = validate_mode(request.mode or "antigravity")
+    if mode != "antigravity":
+        raise HTTPException(status_code=400, detail="独立批量生成导入仅支持 Antigravity 凭证")
     management_label = _generated_management_label(mode)
     credential_data = dict(request.credential_data or {})
     email = str(request.email or "").strip()
@@ -270,16 +272,6 @@ async def import_generated_credential_common(
     if not updated:
         raise RuntimeError(f"绑定专属代理失败: {saved_filename}")
 
-    preview_enabled = False
-    if mode == "geminicli":
-        preview_result = await configure_preview_channel_common(saved_filename, mode="geminicli")
-        if not preview_result.get("success"):
-            error_message = str(
-                preview_result.get("error") or preview_result.get("message") or "开启 Preview 失败"
-            )
-            raise RuntimeError(f"开启 Preview 失败: {error_message}")
-        preview_enabled = True
-
     updated = await storage_adapter.update_credential_state(
         saved_filename,
         {"user_email": email},
@@ -298,7 +290,6 @@ async def import_generated_credential_common(
         "proxy_name": proxy_info["proxy_name"],
         "proxy_url": proxy_info["proxy_url"],
         "user_email": email,
-        "preview_enabled": preview_enabled,
         "mode": mode,
     }
 

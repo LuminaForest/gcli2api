@@ -396,11 +396,11 @@ class BatchGenerateLoginRequest(BaseModel):
     phone_code_url: Optional[str] = None
     proxy_url: Optional[str] = None
     line_number: Optional[int] = None
-    mode: Optional[str] = "geminicli"
+    mode: Optional[str] = "antigravity"
 
 
 class GeneratedCredentialImportRequest(BaseModel):
-    mode: Optional[str] = "geminicli"
+    mode: Optional[str] = "antigravity"
     email: str
     credential_data: Dict[str, Any]
     project_id: Optional[str] = None

@@ -17,8 +17,8 @@ if ! command -v brew &> /dev/null; then
 fi
 
 # 更新 brew 并安装 git
-brew update
-brew install git
+# brew update
+# brew install git
 
 # 安装 uv (Python 环境管理工具)
 curl -Ls https://astral.sh/uv/install.sh | sh

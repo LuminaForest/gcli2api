@@ -19,7 +19,50 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse,
 import httpx
 
 from log import log
-from src.utils import ANTIGRAVITY_USER_AGENT, GEMINICLI_USER_AGENT
+from src.batch_generate_pages.initial_email import submit_initial_email_page
+from src.batch_generate_pages.language import ensure_english_verification_page
+from src.batch_generate_pages.password import submit_password_page, submit_password_page_if_present
+from src.batch_generate_pages.phone_number_entry import (
+    PHONE_NUMBER_UNUSABLE_MESSAGE,
+    PHONE_NUMBER_UNUSABLE_STATUS,
+    submit_phone_number_entry_page,
+)
+from src.batch_generate_pages.phone_verification_code import (
+    submit_phone_verification_code_page,
+    wait_for_phone_verification_code_input,
+)
+from src.batch_generate_pages.robot_verification import wait_for_robot_verification_if_present
+from src.batch_generate_pages.two_fa_authenticator_code import (
+    has_authenticator_code_input,
+    has_authenticator_code_prompt,
+    submit_authenticator_code_page,
+    was_authenticator_code_submitted_recently,
+)
+from src.batch_generate_pages.two_fa_selection import (
+    _page_has_two_step_verification_prompt,
+    select_google_authenticator_app_option_if_present,
+)
+from src.batch_generate_pages.validation import (
+    AccountUnusableError,
+    _contains_phone_rate_limit_message,
+    _is_page_load_failure_error,
+    _is_page_load_failure_result,
+    _is_verify_info_selection_page,
+    _page_body_text,
+    _page_has_service_unavailable,
+    _raise_if_recover_account_page,
+    _raise_if_service_unavailable_page,
+    _validation_page_diagnostic_snapshot,
+    _validation_page_has_phone_input,
+    _validation_page_has_phone_number_entry_prompt,
+    _validation_page_has_phone_prompt,
+    _validation_page_has_phone_rate_limit,
+    _validation_page_has_qr_code,
+    _validation_page_has_send_button,
+    _validation_page_success,
+    _wait_before_page_judgement,
+)
+from src.utils import ANTIGRAVITY_USER_AGENT
 
 
 ProgressLogger = Callable[[str, str], None]
@@ -39,36 +82,15 @@ _2FA_BYPASS_URL = (
 _GOOGLE_ENGLISH_PARAMS = {"hl": "en", "gl": "US", "lr": "lang_en"}
 _PHONE_CODE_PATTERN = re.compile(r"\bG\s*[-:：]\s*([0-9A-Za-z]{4,12})\b", re.IGNORECASE)
 _PHONE_RATE_LIMIT_SENTINEL = "__PHONE_RATE_LIMITED__"
+_ACCOUNT_UNUSABLE_PHONE_STATUSES = {"phone_rate_limited", PHONE_NUMBER_UNUSABLE_STATUS}
 
 
 def _normalize_credential_mode(mode: str) -> str:
-    return "antigravity" if str(mode or "").strip() == "antigravity" else "geminicli"
+    return "antigravity"
 
 
 def _credential_mode_label(mode: str) -> str:
-    return "Antigravity" if _normalize_credential_mode(mode) == "antigravity" else "GCLI"
-
-
-_PHONE_RATE_LIMIT_MARKERS = (
-    "too many failed attempts",
-    "too many attempts",
-    "too many tries",
-    "you've tried too many times",
-    "you have tried too many times",
-    "this phone number has already been used too many times for verification",
-    "phone number has already been used too many times for verification",
-)
-_SERVICE_UNAVAILABLE_MARKERS = (
-    "entire service unavailable",
-    "the entire service is unavailable",
-)
-
-
-class AccountUnusableError(RuntimeError):
-    def __init__(self, status: str, message: str):
-        super().__init__(message)
-        self.status = str(status or "account_unusable").strip() or "account_unusable"
-        self.message = str(message or "").strip()
+    return "Antigravity"
 
 
 def _emit_progress(
@@ -85,6 +107,52 @@ def _emit_progress(
 
     if progress_logger:
         progress_logger(message, level)
+
+
+def _phone_unusable_message(status: str) -> str:
+    if status == PHONE_NUMBER_UNUSABLE_STATUS:
+        return f"当前手机号异常：{PHONE_NUMBER_UNUSABLE_MESSAGE}"
+    return "当前手机号异常：This phone number has already been used too many times for verification"
+
+
+def _build_account_unusable_result(status: str, message: str) -> dict:
+    return {
+        "status": status,
+        "error": message,
+        "account_unusable": True,
+        "validation": {
+            "status": status,
+            "error": message,
+            "account_unusable": True,
+        },
+    }
+
+
+def _prepare_google_verification_page(
+    page,
+    *,
+    label: str,
+    robot_probe_seconds: float = 0,
+    progress_logger: ProgressLogger | None = None,
+) -> str:
+    ensure_english_verification_page(
+        page,
+        label=label,
+        progress_logger=progress_logger,
+    )
+    robot_status = wait_for_robot_verification_if_present(
+        page,
+        emit_progress=_emit_progress,
+        progress_logger=progress_logger,
+        probe_seconds=robot_probe_seconds,
+    )
+    if robot_status:
+        ensure_english_verification_page(
+            page,
+            label=label,
+            progress_logger=progress_logger,
+        )
+    return robot_status
 
 
 def _mask_value(value: str, keep_start: int = 4, keep_end: int = 4) -> str:
@@ -197,33 +265,6 @@ def _build_2fa_request_urls(two_fa_key: str) -> list[str]:
         if url and url not in deduped:
             deduped.append(url)
     return deduped
-
-
-def _totp_submission_cache_key(page) -> str:
-    current_url = str(getattr(page, "url", "") or "")
-    parsed = urlparse(current_url)
-    return f"{parsed.hostname or ''}{parsed.path or ''}"
-
-
-def _was_totp_submitted_recently(page, cooldown_seconds: int = 8) -> bool:
-    last_submission = getattr(_submit_totp_if_needed, "_last_submission", None)
-    if not isinstance(last_submission, dict):
-        return False
-
-    current_key = _totp_submission_cache_key(page)
-    last_key = str(last_submission.get("key") or "")
-    last_at = float(last_submission.get("at") or 0.0)
-    if not current_key or current_key != last_key:
-        return False
-    return (time.monotonic() - last_at) < cooldown_seconds
-
-
-def _mark_totp_submitted(page) -> None:
-    setattr(
-        _submit_totp_if_needed,
-        "_last_submission",
-        {"key": _totp_submission_cache_key(page), "at": time.monotonic()},
-    )
 
 
 def _redact_2fa_url(url: str) -> str:
@@ -415,7 +456,7 @@ def _build_batch_proxy_kwargs(proxy_url: str, request_label: str) -> dict:
     return {
         "proxy": proxy_url or None,
         "_proxy_log": {
-            "mode": "geminicli",
+            "mode": "antigravity",
             "credential": "batch_generate_cache",
             "request_label": request_label,
             "bound_proxy_name": "",
@@ -829,60 +870,6 @@ def _click_oauth_action_if_present(
     return False
 
 
-def _submit_password_if_present(
-    page,
-    password: str,
-    progress_logger: ProgressLogger | None = None,
-) -> bool:
-    if not str(password or ""):
-        return False
-
-    try:
-        if page.locator("input[type='password'], #password input").count() <= 0:
-            return False
-
-        _emit_progress("OAuth阶段检测到密码验证，正在填充密码", progress_logger=progress_logger)
-        selector = _fill_first(
-            page,
-            ["input[type='password']", "#password input"],
-            password,
-            timeout=3000,
-        )
-        if not selector:
-            _emit_progress(
-                "OAuth阶段未找到可填充的密码输入框",
-                level="warning",
-                progress_logger=progress_logger,
-            )
-            return False
-
-        _emit_progress(f"OAuth阶段密码已填充，输入框: {selector}", progress_logger=progress_logger)
-        clicked_selector = _click_first(
-            page,
-            ["#passwordNext button", "button:has-text('Next')", "button:has-text('下一步')"],
-            timeout=3000,
-        )
-        if clicked_selector:
-            _emit_progress(
-                f"OAuth阶段密码下一步已点击，按钮: {clicked_selector}",
-                progress_logger=progress_logger,
-            )
-        else:
-            _emit_progress(
-                "OAuth阶段密码已填充，但未找到下一步按钮",
-                level="warning",
-                progress_logger=progress_logger,
-            )
-        return True
-    except Exception as exc:
-        _emit_progress(
-            f"OAuth阶段处理密码验证失败: {exc}",
-            level="warning",
-            progress_logger=progress_logger,
-        )
-        return False
-
-
 def _submit_email_if_present(
     page,
     email: str,
@@ -1099,222 +1086,6 @@ def _click_later_if_present(
     return False
 
 
-def _page_has_two_step_verification_prompt(page) -> bool:
-    if _validation_page_has_phone_number_entry_prompt(page):
-        return False
-
-    try:
-        page_text = page.locator("body").inner_text(timeout=3000).lower()
-    except Exception:
-        return False
-
-    return any(
-        marker in page_text
-        for marker in (
-            "two-step verification",
-            "2-step verification",
-            "two-factor authentication",
-            "2fa",
-            "choose how you want to sign in",
-            "tap yes on your phone or tablet",
-            "open the gmail app on",
-            "google authenticator",
-            "authenticator app",
-            "两步验证",
-            "两步驟驗證",
-            "选择您要登录的方式",
-            "選擇你要登入的方式",
-            "xác minh 2 bước",
-            "chọn cách bạn muốn đăng nhập",
-        )
-    )
-
-
-def _click_try_another_way_for_gmail_app_prompt(
-    page,
-    progress_logger: ProgressLogger | None = None,
-) -> bool:
-    try:
-        page_text = page.locator("body").inner_text(timeout=3000).lower()
-    except Exception:
-        page_text = ""
-    if "open the gmail app on" not in page_text:
-        return False
-
-    selectors = [
-        "button:has-text('Try another way')",
-        "div[role='button']:has-text('Try another way')",
-        "[role='link']:has-text('Try another way')",
-        "a:has-text('Try another way')",
-        "[tabindex='0']:has-text('Try another way')",
-        "text=Try another way",
-        "button:has-text('尝试其他方式')",
-        "div[role='button']:has-text('尝试其他方式')",
-        "button:has-text('試試其他方式')",
-        "div[role='button']:has-text('試試其他方式')",
-    ]
-    clicked_selector = _click_first_visible(page, selectors, visible_timeout=300, click_timeout=1200)
-    if clicked_selector:
-        _emit_progress(
-            f"检测到 Open the Gmail app on 页面，已点击 Try another way: {clicked_selector}",
-            progress_logger=progress_logger,
-        )
-        return True
-
-    try:
-        clicked_text = page.evaluate(
-            """() => {
-                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-                const visible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return Boolean(rect.width && rect.height) &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none';
-                };
-                const interactive = Array.from(document.querySelectorAll(
-                    "button, [role='button'], [role='link'], a, [jscontroller][jsaction], [tabindex='0']"
-                ));
-                for (const el of interactive) {
-                    if (!visible(el)) continue;
-                    const text = normalize(
-                        el.innerText ||
-                        el.textContent ||
-                        el.getAttribute('aria-label') ||
-                        el.getAttribute('title')
-                    );
-                    const lowerText = text.toLowerCase();
-                    if (
-                        lowerText.includes('try another way') ||
-                        text.includes('尝试其他方式') ||
-                        text.includes('試試其他方式')
-                    ) {
-                        el.scrollIntoView({ block: 'center', inline: 'center' });
-                        el.click();
-                        return text;
-                    }
-                }
-                return '';
-            }"""
-        )
-    except Exception:
-        clicked_text = ""
-
-    if clicked_text:
-        _emit_progress(
-            f"检测到 Open the Gmail app on 页面，已点击 Try another way: {clicked_text}",
-            progress_logger=progress_logger,
-        )
-        return True
-
-    _emit_progress(
-        "检测到 Open the Gmail app on 页面，但未找到 Try another way 按钮",
-        level="warning",
-        progress_logger=progress_logger,
-    )
-    return False
-
-
-def _click_totp_challenge_option_if_present(
-    page,
-    progress_logger: ProgressLogger | None = None,
-) -> bool:
-    primary_selectors = [
-        "button:has-text('Get a verification code from the')",
-        "div[role='button']:has-text('Get a verification code from the')",
-        "[role='link']:has-text('Get a verification code from the')",
-        "a:has-text('Get a verification code from the')",
-        "[tabindex='0']:has-text('Get a verification code from the')",
-        "text=Get a verification code from the",
-        "button:has-text('Google Authenticator')",
-        "div[role='button']:has-text('Google Authenticator')",
-        "[role='link']:has-text('Google Authenticator')",
-        "a:has-text('Google Authenticator')",
-        "[tabindex='0']:has-text('Google Authenticator')",
-        "text=Google Authenticator",
-    ]
-    clicked_selector = _click_first_visible(page, primary_selectors, visible_timeout=300, click_timeout=1200)
-    if clicked_selector:
-        _emit_progress(
-            f"2FA方式选择页已点击验证码入口: {clicked_selector}",
-            progress_logger=progress_logger,
-        )
-        return True
-
-    try:
-        clicked_text = page.evaluate(
-            """() => {
-                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-                const visible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return Boolean(rect.width && rect.height) &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none';
-                };
-                const interactive = Array.from(document.querySelectorAll(
-                    [
-                        "button",
-                        "[role='button']",
-                        "[role='link']",
-                        "a",
-                        "input[type='button']",
-                        "input[type='submit']",
-                        "[jscontroller][jsaction]",
-                        "[tabindex='0']"
-                    ].join(",")
-                ));
-                const textOf = (el) => normalize(
-                    el.innerText ||
-                    el.textContent ||
-                    el.value ||
-                    el.getAttribute('aria-label') ||
-                    el.getAttribute('title')
-                );
-                const click = (el) => {
-                    el.scrollIntoView({ block: 'center', inline: 'center' });
-                    el.click();
-                    return textOf(el);
-                };
-
-                for (const el of interactive) {
-                    if (!visible(el)) continue;
-                    const text = textOf(el).toLowerCase();
-                    if (!text) continue;
-                    if (text.includes('get a verification code from the')) {
-                        return click(el);
-                    }
-                }
-
-                for (const el of interactive) {
-                    if (!visible(el)) continue;
-                    const text = textOf(el).toLowerCase();
-                    if (!text) continue;
-                    if (text.includes('google authenticator')) {
-                        return click(el);
-                    }
-                }
-                return '';
-            }"""
-        )
-    except Exception:
-        clicked_text = ""
-
-    if clicked_text:
-        _emit_progress(
-            f"2FA方式选择页已点击操作项: {clicked_text}",
-            progress_logger=progress_logger,
-        )
-        return True
-
-    _emit_progress(
-        "2FA方式选择页未找到包含 Get a verification code from the 或 Google Authenticator 的组件",
-        level="warning",
-        progress_logger=progress_logger,
-    )
-    return False
-
-
 def _wait_for_oauth_callback(
     page,
     state: str,
@@ -1357,6 +1128,15 @@ def _wait_for_oauth_callback(
                     progress_logger=progress_logger,
                 )
 
+        waited_seconds = _wait_before_page_judgement(
+            page,
+            "OAuth授权阶段页面",
+            progress_logger=progress_logger,
+        )
+        if waited_seconds:
+            start_time += waited_seconds
+            current_url = str(getattr(page, "url", "") or "")
+
         if _remember_oauth_callback_url(page, current_url, progress_logger=progress_logger):
             _emit_progress(
                 "已检测到地址栏OAuth回调URL，准备继续处理",
@@ -1364,10 +1144,24 @@ def _wait_for_oauth_callback(
             )
             return str(getattr(page, "_batch_oauth_callback_url", "") or current_url)
 
+        _prepare_google_verification_page(
+            page,
+            label="OAuth授权阶段页面",
+            progress_logger=progress_logger,
+        )
+
         _raise_if_service_unavailable_page(page, progress_logger=progress_logger)
         _raise_if_recover_account_page(page, progress_logger=progress_logger)
 
-        if _submit_password_if_present(page, password, progress_logger=progress_logger):
+        if submit_password_page_if_present(
+            page,
+            password,
+            fill_first=_fill_first,
+            click_next_button=_click_google_next_button,
+            emit_progress=_emit_progress,
+            progress_logger=progress_logger,
+            log_prefix="OAuth阶段",
+        ):
             page.wait_for_timeout(1000)
             continue
 
@@ -1382,13 +1176,17 @@ def _wait_for_oauth_callback(
             progress_logger=progress_logger,
         )
         if phone_status:
+            if phone_status in _ACCOUNT_UNUSABLE_PHONE_STATUSES:
+                message = _phone_unusable_message(phone_status)
+                _emit_progress(message, level="error", progress_logger=progress_logger)
+                raise AccountUnusableError(phone_status, message)
             page.wait_for_timeout(1000)
             continue
 
         if (
             str(two_fa_key or "").strip()
             and (
-                page.locator("#totpPin, input[name='totpPin']").count() > 0
+                has_authenticator_code_input(page)
                 or _page_has_two_step_verification_prompt(page)
             )
         ):
@@ -1437,51 +1235,6 @@ def _extract_validation_url(response_data: dict) -> str:
                     return url
 
     return ""
-
-
-def _page_body_text(page, timeout: int = 3000) -> str:
-    try:
-        return page.locator("body").inner_text(timeout=timeout)
-    except Exception:
-        return ""
-
-
-def _contains_service_unavailable_message(text: str) -> bool:
-    normalized = str(text or "").lower()
-    return any(marker in normalized for marker in _SERVICE_UNAVAILABLE_MARKERS)
-
-
-def _page_has_service_unavailable(page) -> bool:
-    return _contains_service_unavailable_message(_page_body_text(page, timeout=2000))
-
-
-def _page_has_recover_account(page) -> bool:
-    normalized = re.sub(r"\s+", " ", _page_body_text(page, timeout=2000).lower()).strip()
-    return "recover account" in normalized
-
-
-def _raise_if_recover_account_page(
-    page,
-    progress_logger: ProgressLogger | None = None,
-) -> None:
-    if not _page_has_recover_account(page):
-        return
-
-    message = "页面提示 Recover account，该账号不可用"
-    _emit_progress(message, level="error", progress_logger=progress_logger)
-    raise AccountUnusableError("recover_account_required", message)
-
-
-def _raise_if_service_unavailable_page(
-    page,
-    progress_logger: ProgressLogger | None = None,
-) -> None:
-    if not _page_has_service_unavailable(page):
-        return
-
-    message = "页面提示 Entire service unavailable，该账号不可用"
-    _emit_progress(message, level="error", progress_logger=progress_logger)
-    raise AccountUnusableError("service_unavailable", message)
 
 
 def _click_validation_action(
@@ -1639,26 +1392,6 @@ def _click_validation_phone_option_if_present(
     return False
 
 
-def _is_verify_info_selection_page(page) -> bool:
-    current_url = str(getattr(page, "url", "") or "")
-    parsed = urlparse(current_url)
-    if parsed.hostname == "accounts.google.com" and parsed.path.rstrip("/") == "/uplevelingstep/selection":
-        return True
-
-    try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                    const bodyText = normalize(document.body ? document.body.innerText : '');
-                    return bodyText.includes('verify your info to continue');
-                }"""
-            )
-        )
-    except Exception:
-        return False
-
-
 def _click_verify_your_phone_number_component(
     page,
     progress_logger: ProgressLogger | None = None,
@@ -1721,266 +1454,6 @@ def _click_verify_your_phone_number_component(
         return True
 
     return False
-
-
-def _validation_page_has_qr_code(page) -> bool:
-    if _validation_page_has_phone_prompt(page):
-        return False
-
-    try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const visible = (el) => {
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return Boolean(rect.width && rect.height) &&
-                            style.visibility !== 'hidden' &&
-                            style.display !== 'none' &&
-                            style.opacity !== '0';
-                    };
-                    const media = Array.from(document.querySelectorAll('img, canvas, svg'));
-                    return media.some((el) => {
-                        if (!visible(el)) return false;
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width < 180 || rect.height < 180) return false;
-                        if (rect.width > 520 || rect.height > 520) return false;
-                        const ratio = rect.width / Math.max(rect.height, 1);
-                        if (ratio < 0.8 || ratio > 1.2) return false;
-                        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-                        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-                        const centerX = rect.left + rect.width / 2;
-                        const centerY = rect.top + rect.height / 2;
-                        return (
-                            centerX > viewportWidth * 0.2 &&
-                            centerX < viewportWidth * 0.8 &&
-                            centerY > viewportHeight * 0.15 &&
-                            centerY < viewportHeight * 0.85
-                        );
-                    });
-                }"""
-            )
-        )
-    except Exception:
-        return False
-
-
-def _validation_page_has_phone_number_entry_prompt(page) -> bool:
-    text = re.sub(r"\s+", " ", _page_body_text(page, timeout=2000).lower()).strip()
-    return (
-        "enter a phone number to get a text message with a verification code" in text
-        or (
-            "enter a phone number" in text
-            and "text message" in text
-            and "verification code" in text
-        )
-    )
-
-
-def _validation_page_has_phone_prompt(page) -> bool:
-    if _validation_page_has_phone_number_entry_prompt(page):
-        return True
-
-    try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const visible = (el) => {
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return Boolean(rect.width && rect.height) &&
-                            style.visibility !== 'hidden' &&
-                            style.display !== 'none';
-                    };
-                    const inputs = Array.from(document.querySelectorAll('input'));
-                    const hasPhoneInput = inputs.some((el) => {
-                        if (!visible(el)) return false;
-                        const autocomplete = String(el.autocomplete || '').toLowerCase();
-                        const attrs = [
-                            el.name,
-                            el.id,
-                            autocomplete,
-                            el.className,
-                            el.getAttribute('jsname'),
-                            el.getAttribute('aria-label'),
-                            el.getAttribute('placeholder')
-                        ].join(' ').toLowerCase();
-                        if (
-                            attrs.includes('totp') ||
-                            attrs.includes('code') ||
-                            attrs.includes('idv') ||
-                            attrs.includes('pin')
-                        ) {
-                            return false;
-                        }
-                        return (
-                            el.id === 'phoneNumberId' ||
-                            autocomplete === 'tel' ||
-                            attrs.includes('phone') ||
-                            attrs.includes('mobile') ||
-                            attrs.includes('电话') ||
-                            attrs.includes('手機') ||
-                            attrs.includes('số điện thoại')
-                        );
-                    });
-
-                    if (hasPhoneInput) return true;
-
-                    const phoneSelectors = [
-                        '#phoneNumberId',
-                        '#idvPreregisteredPhoneNext',
-                        '#idvPreregisteredPhonePin',
-                        '#idvAnyPhonePin',
-                        '#idvPin',
-                        '#idvAnyPhonePinNext',
-                        '#idvPinNext'
-                    ];
-                    for (const selector of phoneSelectors) {
-                        const el = document.querySelector(selector);
-                        if (el && visible(el)) return true;
-                    }
-
-                    const phoneAttrPattern = /(phone|mobile|sms|tel|preregisteredphone|anyphone|idvpin|idvphone)/i;
-                    const interactive = Array.from(document.querySelectorAll(
-                        "button, [role='button'], a, [role='link'], div, section"
-                    ));
-                    return interactive.some((el) => {
-                        if (!visible(el)) return false;
-                        const attrs = [
-                            el.id,
-                            el.className,
-                            el.getAttribute('jsname'),
-                            el.getAttribute('aria-controls'),
-                            el.getAttribute('data-secondary-action-label')
-                        ].filter(Boolean).join(' ');
-                        return phoneAttrPattern.test(attrs);
-                    });
-                }"""
-            )
-        )
-    except Exception:
-        return False
-
-
-def _validation_page_has_phone_input(page) -> bool:
-    if _validation_page_has_phone_number_entry_prompt(page):
-        try:
-            return bool(
-                page.evaluate(
-                    """() => Array.from(document.querySelectorAll('input')).some((el) => {
-                        const rect = el.getBoundingClientRect();
-                        const type = String(el.type || '').toLowerCase();
-                        return Boolean(rect.width && rect.height) &&
-                            type !== 'hidden' &&
-                            type !== 'password';
-                    })"""
-                )
-            )
-        except Exception:
-            return False
-
-    try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const inputs = Array.from(document.querySelectorAll('input'));
-                    return inputs.some((el) => {
-                        const rect = el.getBoundingClientRect();
-                        if (!rect.width || !rect.height) return false;
-                        const autocomplete = String(el.autocomplete || '').toLowerCase();
-                        const attrs = [
-                            el.name,
-                            el.id,
-                            autocomplete,
-                            el.getAttribute('aria-label'),
-                            el.getAttribute('placeholder')
-                        ].join(' ').toLowerCase();
-                        if (
-                            attrs.includes('totp') ||
-                            attrs.includes('code') ||
-                            attrs.includes('idv') ||
-                            attrs.includes('pin')
-                        ) {
-                            return false;
-                        }
-                        return (
-                            el.id === 'phoneNumberId' ||
-                            autocomplete === 'tel' ||
-                            attrs.includes('phone') ||
-                            attrs.includes('mobile') ||
-                            attrs.includes('电话') ||
-                            attrs.includes('手機') ||
-                            attrs.includes('số điện thoại')
-                        );
-                    });
-                }"""
-            )
-        )
-    except Exception:
-        return False
-
-
-def _validation_page_diagnostic_snapshot(page) -> str:
-    try:
-        return str(
-            page.evaluate(
-                """() => {
-                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-                    const bodyText = normalize(document.body ? document.body.innerText : '');
-                    const inputs = Array.from(document.querySelectorAll('input'))
-                        .filter((el) => {
-                            const rect = el.getBoundingClientRect();
-                            return Boolean(rect.width && rect.height);
-                        })
-                        .slice(0, 6)
-                        .map((el) => [
-                            el.type,
-                            el.name,
-                            el.id,
-                            el.autocomplete,
-                            el.getAttribute('aria-label'),
-                            el.getAttribute('placeholder')
-                        ].filter(Boolean).join('/'));
-                    const actions = Array.from(document.querySelectorAll('button, [role="button"], a'))
-                        .filter((el) => {
-                            const rect = el.getBoundingClientRect();
-                            return Boolean(rect.width && rect.height);
-                        })
-                        .slice(0, 8)
-                        .map((el) => normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')))
-                        .filter(Boolean);
-                    return `text=${bodyText.slice(0, 300)} | inputs=${inputs.join(' || ')} | actions=${actions.join(' || ')}`;
-                }"""
-            )
-        )
-    except Exception as exc:
-        return f"诊断失败: {exc}"
-
-
-def _validation_page_success(page) -> bool:
-    current_url = str(getattr(page, "url", "") or "")
-    parsed_url = urlparse(current_url)
-    if (
-        parsed_url.hostname == "developers.google.com"
-        and parsed_url.path.rstrip("/") == "/gemini-code-assist/auth/auth_success_gemini"
-    ):
-        return True
-
-    text = _page_body_text(page, timeout=2000).lower()
-    return any(
-        marker in text
-        for marker in (
-            "you’re all set",
-            "you're all set",
-            "verification complete",
-            "verified",
-            "success",
-            "验证完成",
-            "已验证",
-            "hoàn tất",
-            "thành công",
-        )
-    )
 
 
 def _try_fill_validation_phone_input(page, phone: str) -> str:
@@ -2399,7 +1872,7 @@ def _wait_for_validation_after_phone_next(page, timeout_seconds: int = 12) -> st
             return "phone_rate_limited"
         if _validation_page_has_qr_code(page):
             return "qr_required"
-        if _wait_for_validation_code_input(page, timeout_seconds=1):
+        if wait_for_phone_verification_code_input(page, timeout_seconds=1):
             return "code_input"
         page.wait_for_timeout(500)
 
@@ -2421,6 +1894,23 @@ def _fill_validation_phone(page, phone: str, progress_logger: ProgressLogger | N
     if _validation_page_has_qr_code(page):
         return "qr_required"
 
+    if _validation_page_has_phone_number_entry_prompt(page):
+        return submit_phone_number_entry_page(
+            page,
+            phone,
+            fill_first=_fill_first,
+            click_first_visible=_click_first_visible,
+            click_validation_action=_click_validation_action,
+            wait_for_code_input=wait_for_phone_verification_code_input,
+            page_success=_validation_page_success,
+            page_has_phone_rate_limit=_validation_page_has_phone_rate_limit,
+            page_has_qr_code=_validation_page_has_qr_code,
+            diagnostic_snapshot=_validation_page_diagnostic_snapshot,
+            redact_query_value=_redact_query_value,
+            emit_progress=_emit_progress,
+            progress_logger=progress_logger,
+        )
+
     if not _select_phone_verification_method(page, progress_logger=progress_logger):
         if _validation_page_has_qr_code(page):
             return "qr_required"
@@ -2435,6 +1925,23 @@ def _fill_validation_phone(page, phone: str, progress_logger: ProgressLogger | N
             progress_logger=progress_logger,
         )
         return "phone_input_timeout"
+
+    if _validation_page_has_phone_number_entry_prompt(page):
+        return submit_phone_number_entry_page(
+            page,
+            phone,
+            fill_first=_fill_first,
+            click_first_visible=_click_first_visible,
+            click_validation_action=_click_validation_action,
+            wait_for_code_input=wait_for_phone_verification_code_input,
+            page_success=_validation_page_success,
+            page_has_phone_rate_limit=_validation_page_has_phone_rate_limit,
+            page_has_qr_code=_validation_page_has_qr_code,
+            diagnostic_snapshot=_validation_page_diagnostic_snapshot,
+            redact_query_value=_redact_query_value,
+            emit_progress=_emit_progress,
+            progress_logger=progress_logger,
+        )
 
     _emit_progress("已进入手机号输入页，正在填充手机号", progress_logger=progress_logger)
     filled = _try_fill_validation_phone_input(page, phone)
@@ -2516,52 +2023,6 @@ def _extract_phone_code_from_text(text: str) -> str:
     return match.group(1) if match else ""
 
 
-def _contains_phone_rate_limit_message(text: str) -> bool:
-    normalized = str(text or "").lower()
-    return any(marker in normalized for marker in _PHONE_RATE_LIMIT_MARKERS)
-
-
-def _validation_page_has_phone_rate_limit(page) -> bool:
-    try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                    const visible = (el) => {
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return Boolean(rect.width && rect.height) &&
-                            style.visibility !== 'hidden' &&
-                            style.display !== 'none';
-                    };
-                    const texts = Array.from(document.querySelectorAll(
-                        "[role='alert'], [aria-live], [data-error], div, span, p, h1, h2, h3"
-                    ))
-                        .filter((el) => visible(el))
-                        .map((el) => normalize(
-                            el.innerText ||
-                            el.textContent ||
-                            el.getAttribute('aria-label') ||
-                            el.getAttribute('title')
-                        ))
-                        .filter(Boolean);
-                    texts.push(normalize(document.body ? document.body.innerText : ''));
-                    return texts.some((text) =>
-                        text.includes('too many failed attempts') ||
-                        text.includes('too many attempts') ||
-                        text.includes('too many tries') ||
-                        text.includes("you've tried too many times") ||
-                        text.includes('you have tried too many times') ||
-                        text.includes('this phone number has already been used too many times for verification') ||
-                        text.includes('phone number has already been used too many times for verification')
-                    );
-                }"""
-            )
-        )
-    except Exception:
-        return _contains_phone_rate_limit_message(_page_body_text(page, timeout=2000))
-
-
 def _extract_links_from_text(text: str, base_url: str) -> list[str]:
     decoded = html.unescape(str(text or ""))
     links: list[str] = []
@@ -2604,7 +2065,7 @@ def get_phone_verification_code(
             attempt += 1
             try:
                 if attempt == 1:
-                    initial_wait = min(6, max(0, deadline - time.monotonic()))
+                    initial_wait = min(3, max(0, deadline - time.monotonic()))
                     if initial_wait > 0:
                         _emit_progress(
                             f"发送验证码后先等待 {int(max(1, round(initial_wait)))} 秒，再开始获取手机号验证码",
@@ -2691,179 +2152,25 @@ def get_phone_verification_code(
     return ""
 
 
-def _try_fill_validation_code_input(page, code: str) -> str:
-    selector = _fill_first(
-        page,
-        [
-            "#idvPin",
-            "#idvAnyPhonePin",
-            "input[name='idvPin']",
-            "input[name='pin']",
-            "input[autocomplete='one-time-code']",
-            "input[id*='idv' i]",
-            "input[id*='pin' i]",
-            "input[name*='pin' i]",
-            "input[name*='code' i]",
-            "input[id*='code' i]",
-            "input[aria-label*='code' i]",
-            "input[placeholder*='code' i]",
-            "input[aria-label*='验证码' i]",
-            "input[placeholder*='验证码' i]",
-            "input[type='tel']:not(#phoneNumberId):not(#totpPin)",
-            "input[type='number']",
-            "input[type='text']",
-        ],
-        code,
-        timeout=20000,
-    )
-    if selector:
-        return selector
-
-    try:
-        return str(
-            page.evaluate(
-                """(code) => {
-                    const visibleInputs = Array.from(document.querySelectorAll('input'))
-                        .filter((el) => {
-                            const rect = el.getBoundingClientRect();
-                            const type = String(el.type || '').toLowerCase();
-                            return Boolean(rect.width && rect.height) &&
-                                type !== 'hidden' &&
-                                type !== 'password';
-                        });
-
-                    const isCodeInput = (el) => {
-                        const autocomplete = String(el.autocomplete || '').toLowerCase();
-                        const attrs = [
-                            el.type,
-                            el.name,
-                            el.id,
-                            autocomplete,
-                            el.getAttribute('aria-label'),
-                            el.getAttribute('placeholder')
-                        ].join(' ').toLowerCase();
-                        if (attrs.includes('totp') || el.id === 'totpPin') return false;
-                        if (el.id === 'phoneNumberId') return false;
-                        return (
-                            attrs.includes('idv') ||
-                            attrs.includes('one-time-code') ||
-                            attrs.includes('verification') ||
-                            attrs.includes('security code') ||
-                            attrs.includes('enter code') ||
-                            attrs.includes('code') ||
-                            attrs.includes('pin') ||
-                            attrs.includes('验证码')
-                        );
-                    };
-
-                    const fill = (el, label) => {
-                        el.scrollIntoView({ block: 'center', inline: 'center' });
-                        el.focus();
-                        const proto = Object.getPrototypeOf(el);
-                        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-                        if (descriptor && descriptor.set) {
-                            descriptor.set.call(el, code);
-                        } else {
-                            el.value = code;
-                        }
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: code.slice(-1) || '0' }));
-                        return label;
-                    };
-
-                    for (const el of visibleInputs) {
-                        if (!isCodeInput(el)) continue;
-                        const label = [
-                            el.type,
-                            el.name,
-                            el.id,
-                            el.autocomplete,
-                            el.getAttribute('aria-label'),
-                            el.getAttribute('placeholder')
-                        ].filter(Boolean).join('/');
-                        return fill(el, label || 'code input');
-                    }
-                    return '';
-                }""",
-                code,
-            )
-        )
-    except Exception:
-        return ""
-
-
-def _fill_validation_code(page, code: str, progress_logger: ProgressLogger | None = None) -> str:
-    code = str(code or "").strip()
-    if not code:
-        return "code_empty"
-
-    _emit_progress("正在填充手机号验证码", progress_logger=progress_logger)
-    selector = _try_fill_validation_code_input(page, code)
-    if selector:
-        _emit_progress(f"手机号验证码已填充，输入框: {selector}", progress_logger=progress_logger)
-    else:
-        _emit_progress(
-            f"未找到可填充的手机号验证码输入框；诊断: {_validation_page_diagnostic_snapshot(page)}",
-            level="warning",
-            progress_logger=progress_logger,
-        )
-        return "code_input_not_found"
-
-    _refresh_validation_code_input_events(page, code)
-
-    submit_status = "code_next_not_triggered"
-    for attempt in range(1, 3):
-        if not _click_validation_code_next(page, progress_logger=progress_logger):
-            break
-
-        submit_status = _wait_for_validation_after_code_submit(page, timeout_seconds=8)
-        if submit_status in {"submitted", "success", "qr_required", "phone_rate_limited"}:
-            break
-
-        if attempt < 2 and submit_status == "code_next_not_triggered":
-            _emit_progress(
-                "验证码下一步点击后仍停留在验证码输入页，正在重试提交",
-                level="warning",
-                progress_logger=progress_logger,
-            )
-            _refresh_validation_code_input_events(page, code)
-            continue
-        break
-
-    if submit_status == "code_next_not_triggered":
-        _emit_progress(
-            f"手机号验证码已填充，但未能触发下一步；诊断: {_validation_page_diagnostic_snapshot(page)}",
-            level="warning",
-            progress_logger=progress_logger,
-        )
-        return "code_next_not_triggered"
-    if submit_status == "phone_rate_limited":
-        _emit_progress(
-            "当前手机号异常：该手机号已被用于验证过多次",
-            level="warning",
-            progress_logger=progress_logger,
-        )
-        return "phone_rate_limited"
-    if submit_status == "success":
-        _emit_progress("手机号验证码提交后页面已完成验证", progress_logger=progress_logger)
-    elif submit_status == "qr_required":
-        _emit_progress("手机号验证码提交后出现二维码", level="warning", progress_logger=progress_logger)
-
-    return submit_status
-
-
 def _submit_phone_verification_if_present(
     page,
     phone: str,
     phone_code_url: str,
     progress_logger: ProgressLogger | None = None,
 ) -> str:
-    if not (_validation_page_has_phone_prompt(page) or _validation_page_has_phone_number_entry_prompt(page)):
-        return ""
+    _prepare_google_verification_page(
+        page,
+        label="手机号验证页面",
+        progress_logger=progress_logger,
+    )
+    if wait_for_phone_verification_code_input(page, timeout_seconds=1):
+        phone_status = "code_input"
+    else:
+        if not (_validation_page_has_phone_prompt(page) or _validation_page_has_phone_number_entry_prompt(page)):
+            return ""
 
-    _emit_progress("检测到手机号验证页面，准备填写上传文件第4个参数手机号", progress_logger=progress_logger)
-    phone_status = _fill_validation_phone(page, phone, progress_logger=progress_logger)
+        _emit_progress("检测到手机号验证页面，准备填写上传文件第4个参数手机号", progress_logger=progress_logger)
+        phone_status = _fill_validation_phone(page, phone, progress_logger=progress_logger)
     if phone_status in {"success", "phone_rate_limited", "qr_required"}:
         return phone_status
     if phone_status != "code_input":
@@ -2880,295 +2187,44 @@ def _submit_phone_verification_if_present(
     if not code:
         return "code_fetch_failed"
 
-    return _fill_validation_code(page, code, progress_logger=progress_logger)
-
-
-def _validation_page_has_code_input(page) -> bool:
-    if _validation_page_has_phone_number_entry_prompt(page):
-        return False
-
-    try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const visibleInputs = Array.from(document.querySelectorAll('input'))
-                        .filter((el) => {
-                            const rect = el.getBoundingClientRect();
-                            const type = String(el.type || '').toLowerCase();
-                            return Boolean(rect.width && rect.height) &&
-                                type !== 'hidden' &&
-                                type !== 'password';
-                        });
-
-                    return visibleInputs.some((el) => {
-                        const autocomplete = String(el.autocomplete || '').toLowerCase();
-                        const attrs = [
-                            el.type,
-                            el.name,
-                            el.id,
-                            autocomplete,
-                            el.getAttribute('aria-label'),
-                            el.getAttribute('placeholder')
-                        ].join(' ').toLowerCase();
-                        if (attrs.includes('totp') || el.id === 'totpPin' || el.id === 'phoneNumberId') {
-                            return false;
-                        }
-                        return (
-                            attrs.includes('idv') ||
-                            attrs.includes('one-time-code') ||
-                            attrs.includes('verification') ||
-                            attrs.includes('security code') ||
-                            attrs.includes('enter code') ||
-                            attrs.includes('code') ||
-                            attrs.includes('pin') ||
-                            attrs.includes('验证码')
-                        );
-                    });
-                }"""
-            )
-        )
-    except Exception:
-        return False
-
-
-def _wait_for_validation_code_input(page, timeout_seconds: int = 90) -> bool:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if _validation_page_has_phone_number_entry_prompt(page):
-            return False
-
-        text = _page_body_text(page, timeout=2000).lower()
-        has_code_text = any(
-            marker in text
-            for marker in (
-                "verification code",
-                "enter the code",
-                "enter your code",
-                "security code",
-                "code was sent",
-                "text message",
-                "sms",
-                "验证码",
-                "短信",
-                "mã xác minh",
-                "tin nhắn",
-            )
-        )
-        try:
-            has_code_input = bool(
-                page.evaluate(
-                    """(hasCodeText) => {
-                        const visibleInputs = Array.from(document.querySelectorAll('input'))
-                            .filter((el) => {
-                                const rect = el.getBoundingClientRect();
-                                const type = String(el.type || '').toLowerCase();
-                                return Boolean(rect.width && rect.height) &&
-                                    type !== 'hidden' &&
-                                    type !== 'password';
-                            });
-
-                        const nonPhoneInputs = visibleInputs.filter((el) => {
-                            const autocomplete = String(el.autocomplete || '').toLowerCase();
-                            const attrs = [
-                                el.type,
-                                el.name,
-                                el.id,
-                                autocomplete,
-                                el.getAttribute('aria-label'),
-                                el.getAttribute('placeholder')
-                            ].join(' ').toLowerCase();
-                            const codeLike =
-                                attrs.includes('idv') ||
-                                attrs.includes('one-time-code') ||
-                                attrs.includes('verification') ||
-                                attrs.includes('security code') ||
-                                attrs.includes('enter code') ||
-                                attrs.includes('code') ||
-                                attrs.includes('pin') ||
-                                attrs.includes('验证码');
-                            const phoneLike =
-                                !codeLike &&
-                                (
-                                    el.id === 'phoneNumberId' ||
-                                    autocomplete === 'tel' ||
-                                    attrs.includes('phone') ||
-                                    attrs.includes('mobile') ||
-                                    attrs.includes('电话') ||
-                                    attrs.includes('手機') ||
-                                    attrs.includes('số điện thoại')
-                                );
-                            const totpLike = attrs.includes('totp') || el.id === 'totpPin';
-                            return !phoneLike && !totpLike;
-                        });
-
-                        const explicitCodeInput = nonPhoneInputs.some((el) => {
-                            const attrs = [
-                                el.type,
-                                el.name,
-                                el.id,
-                                el.autocomplete,
-                                el.getAttribute('aria-label'),
-                                el.getAttribute('placeholder')
-                            ].join(' ').toLowerCase();
-                            return (
-                                attrs.includes('idvpin') ||
-                                attrs.includes('one-time-code') ||
-                                attrs.includes('verification') ||
-                                attrs.includes('security code') ||
-                                attrs.includes('enter code') ||
-                                attrs.includes('code') ||
-                                attrs.includes('pin') ||
-                                attrs.includes('验证码')
-                            );
-                        });
-                        if (explicitCodeInput) return true;
-                        if (!hasCodeText) return false;
-
-                        return nonPhoneInputs.some((el) => {
-                            const type = String(el.type || '').toLowerCase();
-                            return ['tel', 'text', 'number'].includes(type || 'text');
-                        });
-                    }""",
-                    has_code_text,
-                )
-            )
-        except Exception:
-            has_code_input = False
-
-        if has_code_text and has_code_input:
-            return True
-        page.wait_for_timeout(1000)
-    return False
-
-
-def _refresh_validation_code_input_events(page, code: str) -> bool:
-    try:
-        return bool(
-            page.evaluate(
-                """(code) => {
-                    const selectors = [
-                        "#idvPin",
-                        "#idvAnyPhonePin",
-                        "input[name='idvPin']",
-                        "input[name='pin']",
-                        "input[autocomplete='one-time-code']",
-                        "input[id*='idv' i]",
-                        "input[id*='pin' i]",
-                        "input[name*='pin' i]",
-                        "input[name*='code' i]",
-                        "input[id*='code' i]",
-                        "input[aria-label*='code' i]",
-                        "input[placeholder*='code' i]"
-                    ];
-                    let input = null;
-                    for (const selector of selectors) {
-                        input = document.querySelector(selector);
-                        if (input) break;
-                    }
-                    if (!input) return false;
-
-                    input.focus();
-                    const proto = Object.getPrototypeOf(input);
-                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-                    if (descriptor && descriptor.set) {
-                        descriptor.set.call(input, code);
-                    } else {
-                        input.value = code;
-                    }
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                    input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: code.slice(-1) || '0' }));
-                    input.blur();
-                    input.focus();
-                    return true;
-                }""",
-                code,
-            )
-        )
-    except Exception:
-        return False
-
-
-def _click_validation_code_next(page, progress_logger: ProgressLogger | None = None) -> bool:
-    playwright_selectors = [
-        "#idvAnyPhonePinNext button",
-        "#idvAnyPhonePinNext",
-        "#idvPinNext button",
-        "#idvPinNext",
-        "#next button",
-        "#next",
-        "button:has-text('Next')",
-        "div[role='button']:has-text('Next')",
-        "button:has-text('Continue')",
-        "div[role='button']:has-text('Continue')",
-        "button:has-text('Verify')",
-        "div[role='button']:has-text('Verify')",
-        "button:has-text('Submit')",
-        "div[role='button']:has-text('Submit')",
-        "button:has-text('Done')",
-        "div[role='button']:has-text('Done')",
-        "button:has-text('下一步')",
-        "div[role='button']:has-text('下一步')",
-        "button:has-text('继续')",
-        "div[role='button']:has-text('继续')",
-        "button:has-text('验证')",
-        "div[role='button']:has-text('验证')",
-        "button:has-text('提交')",
-        "div[role='button']:has-text('提交')",
-        "button:has-text('Tiếp tục')",
-        "div[role='button']:has-text('Tiếp tục')",
-        "button:has-text('Xác minh')",
-        "div[role='button']:has-text('Xác minh')",
-    ]
-    clicked_selector = _click_first_visible(page, playwright_selectors, visible_timeout=200, click_timeout=800)
-    if clicked_selector:
-        _emit_progress(f"手机号验证码下一步已点击，按钮: {clicked_selector}", progress_logger=progress_logger)
-        return True
-
-    if _click_validation_action(
+    return submit_phone_verification_code_page(
         page,
-        [
-            "Next",
-            "Continue",
-            "Verify",
-            "Submit",
-            "Done",
-            "下一步",
-            "继续",
-            "验证",
-            "提交",
-            "完成",
-            "Tiếp tục",
-            "Xác minh",
-            "Hoàn tất",
-        ],
+        code,
+        fill_first=_fill_first,
+        click_first_visible=_click_first_visible,
+        click_validation_action=_click_validation_action,
+        page_success=_validation_page_success,
+        page_has_phone_rate_limit=_validation_page_has_phone_rate_limit,
+        page_has_qr_code=_validation_page_has_qr_code,
+        diagnostic_snapshot=_validation_page_diagnostic_snapshot,
+        emit_progress=_emit_progress,
         progress_logger=progress_logger,
-    ):
-        return True
+    )
 
+
+def _bound_phone_send_button_result(
+    page,
+    progress_logger: ProgressLogger | None = None,
+) -> dict | None:
+    if not _validation_page_has_send_button(page):
+        return None
+
+    message = "登录提交后复查页出现 Send 按钮，该邮箱已绑定手机"
+    _emit_progress(f"{message}，Chrome窗口将保持打开 3 秒后关闭", level="error", progress_logger=progress_logger)
     try:
-        page.locator(
-            "#idvAnyPhonePin, #idvPin, input[name='pin'], input[name='idvPin'], input[autocomplete='one-time-code']"
-        ).first.press("Enter", timeout=1500)
-        _emit_progress("已在验证码输入框按 Enter 触发下一步", progress_logger=progress_logger)
-        return True
+        page.wait_for_timeout(3000)
     except Exception:
-        return False
-
-
-def _wait_for_validation_after_code_submit(page, timeout_seconds: int = 8) -> str:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if _validation_page_success(page):
-            return "success"
-        if _validation_page_has_phone_rate_limit(page):
-            return "phone_rate_limited"
-        if _validation_page_has_qr_code(page):
-            return "qr_required"
-        if not _validation_page_has_code_input(page):
-            return "submitted"
-        page.wait_for_timeout(400)
-    return "code_next_not_triggered"
+        pass
+    return {
+        "status": "email_phone_already_bound",
+        "error": message,
+        "account_unusable": True,
+        "validation": {
+            "status": "email_phone_already_bound",
+            "account_unusable": True,
+            "message": message,
+        },
+    }
 
 
 def _handle_validation_url(
@@ -3222,6 +2278,11 @@ def _handle_validation_url(
                 progress_logger=progress_logger,
             )
 
+        _prepare_google_verification_page(
+            page,
+            label="账号验证页面",
+            progress_logger=progress_logger,
+        )
         _click_later_if_present(page, progress_logger=progress_logger)
 
         if _page_has_service_unavailable(page):
@@ -3232,6 +2293,10 @@ def _handle_validation_url(
                 level="error",
                 progress_logger=progress_logger,
             )
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                time.sleep(3)
             return result
 
         if _validation_page_success(page):
@@ -3290,17 +2355,22 @@ def _handle_validation_url(
             )
             return result
 
-        if _validation_page_has_phone_prompt(page):
-            phone_status = _fill_validation_phone(page, phone, progress_logger=progress_logger)
+        phone_code_input_ready = wait_for_phone_verification_code_input(page, timeout_seconds=1)
+        if phone_code_input_ready or _validation_page_has_phone_prompt(page):
+            if phone_code_input_ready:
+                phone_status = "code_input"
+            else:
+                phone_status = _fill_validation_phone(page, phone, progress_logger=progress_logger)
             if phone_status == "success":
                 result["status"] = "success"
                 _emit_progress("账号手机号验证已完成", progress_logger=progress_logger)
                 return result
-            if phone_status == "phone_rate_limited":
-                result["status"] = "phone_rate_limited"
+            if phone_status in _ACCOUNT_UNUSABLE_PHONE_STATUSES:
+                result["status"] = phone_status
                 result["account_unusable"] = True
+                message = _phone_unusable_message(phone_status)
                 _emit_progress(
-                    "当前手机号异常：This phone number has already been used too many times for verification",
+                    message,
                     level="error",
                     progress_logger=progress_logger,
                 )
@@ -3343,7 +2413,19 @@ def _handle_validation_url(
                 result["status"] = "code_fetch_failed"
                 return result
 
-            code_submit_status = _fill_validation_code(page, code, progress_logger=progress_logger)
+            code_submit_status = submit_phone_verification_code_page(
+                page,
+                code,
+                fill_first=_fill_first,
+                click_first_visible=_click_first_visible,
+                click_validation_action=_click_validation_action,
+                page_success=_validation_page_success,
+                page_has_phone_rate_limit=_validation_page_has_phone_rate_limit,
+                page_has_qr_code=_validation_page_has_qr_code,
+                diagnostic_snapshot=_validation_page_diagnostic_snapshot,
+                emit_progress=_emit_progress,
+                progress_logger=progress_logger,
+            )
             if code_submit_status == "phone_rate_limited":
                 result["status"] = "phone_rate_limited"
                 result["account_unusable"] = True
@@ -3413,10 +2495,11 @@ def _handle_validation_url(
 async def _test_cached_gemini_credential(
     credential_data: dict,
     proxy_url: str,
-    mode: str = "geminicli",
+    mode: str = "antigravity",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
-    from config import get_antigravity_api_url, get_code_assist_endpoint
+    from config import get_antigravity_api_url
+    from src.api.antigravity import build_antigravity_headers
     from src.httpx_client import _extract_httpx_error_message, post_async
 
     mode = _normalize_credential_mode(mode)
@@ -3425,18 +2508,8 @@ async def _test_cached_gemini_credential(
     project_id = credential_data.get("project_id")
     test_model = "gemini-2.5-flash"
 
-    if mode == "antigravity":
-        from src.api.antigravity import build_antigravity_headers
-
-        api_base_url = await get_antigravity_api_url()
-        headers = build_antigravity_headers(access_token, test_model)
-    else:
-        api_base_url = await get_code_assist_endpoint()
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "User-Agent": GEMINICLI_USER_AGENT,
-        }
+    api_base_url = await get_antigravity_api_url()
+    headers = build_antigravity_headers(access_token, test_model)
 
     _emit_progress(
         f"正在使用临时{mode_label}凭证测试 {test_model}: project_id={project_id}",
@@ -3509,7 +2582,7 @@ async def _test_cached_gemini_credential(
 async def _build_cached_credential_from_callback_url(
     callback_url: str,
     proxy_url: str,
-    mode: str = "geminicli",
+    mode: str = "antigravity",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
     from src.auth import (
@@ -3518,7 +2591,7 @@ async def _build_cached_credential_from_callback_url(
         _prepare_credentials_data,
         auth_flows,
     )
-    from config import get_antigravity_api_url, get_code_assist_endpoint
+    from config import get_antigravity_api_url
     from src.google_oauth_api import fetch_project_id_and_tier
 
     mode = _normalize_credential_mode(mode)
@@ -3548,14 +2621,9 @@ async def _build_cached_credential_from_callback_url(
         _emit_progress("OAuth访问令牌获取成功", progress_logger=progress_logger)
 
         try:
-            if mode == "antigravity":
-                _emit_progress("正在从Antigravity接口检测 project_id", progress_logger=progress_logger)
-                api_base_url = await get_antigravity_api_url()
-                user_agent = ANTIGRAVITY_USER_AGENT
-            else:
-                _emit_progress("正在从Code Assist接口检测 project_id", progress_logger=progress_logger)
-                api_base_url = await get_code_assist_endpoint()
-                user_agent = GEMINICLI_USER_AGENT
+            _emit_progress("正在从Antigravity接口检测 project_id", progress_logger=progress_logger)
+            api_base_url = await get_antigravity_api_url()
+            user_agent = ANTIGRAVITY_USER_AGENT
 
             project_id, subscription_tier = await fetch_project_id_and_tier(
                 credentials.access_token,
@@ -3611,7 +2679,7 @@ async def _build_cached_credential_from_callback_url(
 async def _build_cached_credential_from_origin_callback_url(
     callback_url: str,
     proxy_url: str,
-    mode: str = "geminicli",
+    mode: str = "antigravity",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
     mode = _normalize_credential_mode(mode)
@@ -3676,7 +2744,7 @@ def _authorize_logged_in_account_and_test(
     phone: str,
     phone_code_url: str,
     proxy_url: str,
-    mode: str = "geminicli",
+    mode: str = "antigravity",
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
     from src.auth import _cleanup_auth_flow_server, create_auth_url
@@ -4116,48 +3184,45 @@ def _submit_totp_if_needed(
     try:
         _emit_progress("正在检查是否出现2FA验证页面", progress_logger=progress_logger)
         page.wait_for_timeout(300)
-        if _was_totp_submitted_recently(page):
+        _prepare_google_verification_page(
+            page,
+            label="2FA验证页面",
+            progress_logger=progress_logger,
+        )
+        if was_authenticator_code_submitted_recently(page):
             return
-        if _validation_page_has_phone_number_entry_prompt(page):
-            _emit_progress("当前页面是手机号输入页，跳过2FA自动填充", progress_logger=progress_logger)
+        if _validation_page_has_phone_prompt(page) or _validation_page_has_phone_number_entry_prompt(page):
+            _emit_progress("当前页面是手机号验证页，跳过2FA自动填充", progress_logger=progress_logger)
             return
-
-        two_step_prompt = _page_has_two_step_verification_prompt(page)
-        if two_step_prompt:
-            _emit_progress(
-                "检测到两步验证方式选择页，正在尝试切换到 Google Authenticator 验证码输入",
-                progress_logger=progress_logger,
-            )
-            if _click_try_another_way_for_gmail_app_prompt(page, progress_logger=progress_logger):
-                page.wait_for_timeout(1200)
-            _click_totp_challenge_option_if_present(page, progress_logger=progress_logger)
 
         has_totp = False
-        wait_deadline = time.monotonic() + 8
+        two_step_prompt = False
+        two_step_option_clicked = False
+        wait_deadline = time.monotonic() + 30
         while time.monotonic() < wait_deadline:
-            if _validation_page_has_phone_number_entry_prompt(page):
-                _emit_progress("当前页面是手机号输入页，跳过2FA自动填充", progress_logger=progress_logger)
+            if _validation_page_has_phone_prompt(page) or _validation_page_has_phone_number_entry_prompt(page):
+                _emit_progress("当前页面是手机号验证页，跳过2FA自动填充", progress_logger=progress_logger)
                 return
 
-            has_totp = page.locator("#totpPin, input[name='totpPin']").count() > 0
+            has_totp = has_authenticator_code_input(page)
             if has_totp:
                 break
-            if not two_step_prompt:
-                break
-            page.wait_for_timeout(400)
+
+            two_step_prompt = _page_has_two_step_verification_prompt(page)
+            if two_step_prompt:
+                if not two_step_option_clicked:
+                    two_step_option_clicked = select_google_authenticator_app_option_if_present(
+                        page,
+                        emit_progress=_emit_progress,
+                        progress_logger=progress_logger,
+                    )
+                page.wait_for_timeout(800)
+                continue
+
+            page.wait_for_timeout(500)
 
         if not has_totp and not two_step_prompt:
-            page_text = page.locator("body").inner_text(timeout=3000).lower()
-            has_totp = any(
-                marker in page_text
-                for marker in (
-                    "两步验证",
-                    "two-step verification",
-                    "two-factor authentication",
-                    "2fa",
-                    "verification code",
-                )
-            )
+            has_totp = has_authenticator_code_prompt(page)
         if not has_totp:
             if two_step_prompt:
                 _emit_progress(
@@ -4169,54 +3234,16 @@ def _submit_totp_if_needed(
                 _emit_progress("未检测到2FA验证页面", progress_logger=progress_logger)
             return
 
-        _emit_progress("检测到2FA，正在获取验证码", progress_logger=progress_logger)
-        code = get_2fa_code(two_fa_key, progress_logger=progress_logger)
-        if not code:
-            _emit_progress(
-                "检测到2FA，但未获取到验证码",
-                level="warning",
-                progress_logger=progress_logger,
-            )
-            return
-
-        _emit_progress("正在填充2FA验证码", progress_logger=progress_logger)
-        selector = _fill_first(
+        submit_authenticator_code_page(
             page,
-            ["#totpPin", "input[name='totpPin']"],
-            code,
-            timeout=8000,
+            two_fa_key,
+            get_2fa_code=get_2fa_code,
+            fill_first=_fill_first,
+            click_first=_click_first,
+            click_later_if_present=_click_later_if_present,
+            emit_progress=_emit_progress,
+            progress_logger=progress_logger,
         )
-        if selector:
-            _emit_progress(f"2FA验证码已填充，输入框: {selector}", progress_logger=progress_logger)
-            clicked_selector = _click_first(
-                page,
-                [
-                    "#totpNext button",
-                    "button:has-text('Next')",
-                    "button:has-text('下一步')",
-                ],
-                timeout=8000,
-            )
-            if clicked_selector:
-                _mark_totp_submitted(page)
-                _emit_progress(
-                    f"2FA验证码已提交，按钮: {clicked_selector}",
-                    progress_logger=progress_logger,
-                )
-                page.wait_for_timeout(1500)
-                _click_later_if_present(page, progress_logger=progress_logger)
-            else:
-                _emit_progress(
-                    "2FA验证码已填充，但未找到下一步按钮",
-                    level="warning",
-                    progress_logger=progress_logger,
-                )
-        else:
-            _emit_progress(
-                "未找到可填充的2FA验证码输入框",
-                level="warning",
-                progress_logger=progress_logger,
-            )
     except Exception as exc:
         _emit_progress(
             f"处理2FA失败: {exc}",
@@ -4232,7 +3259,7 @@ def run_google_login(
     phone: str = "",
     phone_code_url: str = "",
     proxy_url: str = "",
-    mode: str = "geminicli",
+    mode: str = "antigravity",
     keep_open_seconds: int = 600,
     progress_logger: ProgressLogger | None = None,
 ) -> dict:
@@ -4316,86 +3343,53 @@ def run_google_login(
                 pass
         _install_english_navigation_guard(context, progress_logger=progress_logger)
         page = context.new_page()
+        page.wait_for_timeout(2000)
 
         try:
             _emit_progress("正在打开Google登录页面", progress_logger=progress_logger)
-            _goto_english(page, login_url, wait_until="domcontentloaded", timeout=60000)
-
-            _emit_progress(f"正在填充邮箱: {email}", progress_logger=progress_logger)
-            email_selector = _fill_first(
+            _goto_english(page, login_url, wait_until="commit", timeout=30000)
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+            _prepare_google_verification_page(
                 page,
-                ["#identifierId", "input[type='email']"],
+                label="初始登录邮箱页",
+                progress_logger=progress_logger,
+            )
+            submit_initial_email_page(
+                page,
                 email,
-                timeout=30000,
+                fill_first=_fill_first,
+                click_next_button=_click_google_next_button,
+                wait_before_page_judgement=_wait_before_page_judgement,
+                emit_progress=_emit_progress,
+                progress_logger=progress_logger,
             )
-            if email_selector:
-                _emit_progress(f"邮箱已填充，输入框: {email_selector}", progress_logger=progress_logger)
-            else:
-                _emit_progress(
-                    "未找到邮箱输入框",
-                    level="warning",
-                    progress_logger=progress_logger,
-                )
-            email_next_selector = _click_google_next_button(
+            _prepare_google_verification_page(
                 page,
-                [
-                    "#identifierNext button",
-                    "#identifierNext [role='button']",
-                    "#identifierNext",
-                ],
-                enter_selector="#identifierId, input[type='email']",
-                timeout=10000,
+                label="初始登录邮箱提交后页面",
+                robot_probe_seconds=30,
+                progress_logger=progress_logger,
             )
-            if email_next_selector:
-                _emit_progress(
-                    f"邮箱下一步已点击，按钮: {email_next_selector}",
-                    progress_logger=progress_logger,
-                )
-            else:
-                _emit_progress(
-                    "未找到邮箱下一步按钮",
-                    level="warning",
-                    progress_logger=progress_logger,
-                )
 
-            _emit_progress("正在填充密码", progress_logger=progress_logger)
-            password_selector = _fill_first(
+            submit_password_page(
                 page,
-                ["input[type='password']", "#password input"],
                 password,
-                timeout=30000,
+                fill_first=_fill_first,
+                click_next_button=_click_google_next_button,
+                emit_progress=_emit_progress,
+                progress_logger=progress_logger,
             )
-            if password_selector:
-                _emit_progress(f"密码已填充，输入框: {password_selector}", progress_logger=progress_logger)
-            else:
-                _emit_progress(
-                    "未找到密码输入框",
-                    level="warning",
-                    progress_logger=progress_logger,
-                )
-            password_next_selector = _click_google_next_button(
-                page,
-                [
-                    "#passwordNext button",
-                    "#passwordNext [role='button']",
-                    "#passwordNext",
-                ],
-                enter_selector="input[type='password'], #password input",
-                timeout=10000,
-            )
-            if password_next_selector:
-                _emit_progress(
-                    f"密码下一步已点击，按钮: {password_next_selector}",
-                    progress_logger=progress_logger,
-                )
-            else:
-                _emit_progress(
-                    "未找到密码下一步按钮",
-                    level="warning",
-                    progress_logger=progress_logger,
-                )
 
             page.wait_for_timeout(1500)
+            _wait_before_page_judgement(
+                page,
+                "登录提交后验证页",
+                progress_logger=progress_logger,
+            )
+            _prepare_google_verification_page(
+                page,
+                label="登录提交后验证页",
+                progress_logger=progress_logger,
+            )
             _click_later_if_present(page, progress_logger=progress_logger)
             _raise_if_recover_account_page(page, progress_logger=progress_logger)
             _submit_totp_if_needed(page, two_fa_key, progress_logger=progress_logger)
@@ -4406,9 +3400,38 @@ def run_google_login(
                 progress_logger=progress_logger,
             )
             if phone_status:
+                if phone_status in _ACCOUNT_UNUSABLE_PHONE_STATUSES:
+                    message = _phone_unusable_message(phone_status)
+                    _emit_progress(f"登录阶段手机号验证处理结果: {message}", progress_logger=progress_logger)
+                    _emit_progress(message, level="error", progress_logger=progress_logger)
+                    result = _build_account_unusable_result(phone_status, message)
+                    return result
                 _emit_progress(f"登录阶段手机号验证处理结果: {phone_status}", progress_logger=progress_logger)
             _emit_progress(f"已提交Google登录信息: email={email}", progress_logger=progress_logger)
             page.wait_for_timeout(3000)
+            _prepare_google_verification_page(
+                page,
+                label="登录提交后复查页",
+                progress_logger=progress_logger,
+            )
+            bound_phone_result = _bound_phone_send_button_result(page, progress_logger=progress_logger)
+            if bound_phone_result:
+                result = bound_phone_result
+                return result
+            _wait_before_page_judgement(
+                page,
+                "登录提交后复查页",
+                progress_logger=progress_logger,
+            )
+            _prepare_google_verification_page(
+                page,
+                label="登录提交后复查页",
+                progress_logger=progress_logger,
+            )
+            bound_phone_result = _bound_phone_send_button_result(page, progress_logger=progress_logger)
+            if bound_phone_result:
+                result = bound_phone_result
+                return result
             _click_later_if_present(page, progress_logger=progress_logger)
             _raise_if_recover_account_page(page, progress_logger=progress_logger)
             phone_status = _submit_phone_verification_if_present(
@@ -4418,6 +3441,12 @@ def run_google_login(
                 progress_logger=progress_logger,
             )
             if phone_status:
+                if phone_status in _ACCOUNT_UNUSABLE_PHONE_STATUSES:
+                    message = _phone_unusable_message(phone_status)
+                    _emit_progress(f"登录阶段手机号验证复查结果: {message}", progress_logger=progress_logger)
+                    _emit_progress(message, level="error", progress_logger=progress_logger)
+                    result = _build_account_unusable_result(phone_status, message)
+                    return result
                 _emit_progress(f"登录阶段手机号验证复查结果: {phone_status}", progress_logger=progress_logger)
 
             result = _authorize_logged_in_account_and_test(
@@ -4431,13 +3460,19 @@ def run_google_login(
                 mode=mode,
                 progress_logger=progress_logger,
             )
-            if (result or {}).get("account_unusable"):
+            if _is_page_load_failure_result(result):
+                _emit_progress(
+                    "检测到页面加载失败，Chrome窗口将立即关闭并等待外层切换代理重试",
+                    level="warning",
+                    progress_logger=progress_logger,
+                )
+            elif (result or {}).get("account_unusable"):
                 validation_status = str(
                     ((result or {}).get("validation") or {}).get("status")
                     or (result or {}).get("status")
                     or ""
                 ).strip()
-                if validation_status in {"phone_rate_limited", "service_unavailable"}:
+                if validation_status in {"phone_rate_limited", PHONE_NUMBER_UNUSABLE_STATUS, "service_unavailable"}:
                     _emit_progress(
                         "当前账号不可用，Chrome窗口将立即关闭并继续下一个账号",
                         level="warning",
@@ -4458,17 +3493,25 @@ def run_google_login(
                 page.wait_for_timeout(max(1, keep_open_seconds) * 1000)
         except Exception as exc:
             error_text = str(exc).strip() or type(exc).__name__
-            result["status"] = "automation_failed"
+            is_page_load_failure = _is_page_load_failure_error(error_text)
+            result["status"] = "page_load_failed" if is_page_load_failure else "automation_failed"
             result["error"] = error_text
             _emit_progress(
                 f"Google登录自动化异常: email={email}, error={error_text}",
                 level="warning",
                 progress_logger=progress_logger,
             )
-            try:
-                page.wait_for_timeout(30000)
-            except Exception:
-                pass
+            if is_page_load_failure:
+                _emit_progress(
+                    "页面加载失败，Chrome窗口将立即关闭并等待切换代理重试",
+                    level="warning",
+                    progress_logger=progress_logger,
+                )
+            else:
+                try:
+                    page.wait_for_timeout(30000)
+                except Exception:
+                    pass
         finally:
             _emit_progress("正在关闭浏览器上下文", progress_logger=progress_logger)
             if page is not None:

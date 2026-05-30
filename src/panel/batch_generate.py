@@ -21,11 +21,11 @@ from src.models import BatchGenerateLoginRequest
 from src.proxy_config import generate_proxy_url_from_generator
 from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token
-from .creds import configure_preview_channel_common
-from .utils import validate_mode
 
 
 router = APIRouter(prefix="/batch-generate", tags=["batch-generate"])
+_BATCH_GENERATE_MODE = "antigravity"
+_BATCH_GENERATE_MANAGEMENT_LABEL = "AG凭证管理"
 
 _LOGIN_TASKS: dict[str, dict] = {}
 _LOGIN_TASK_LOCK = Lock()
@@ -52,10 +52,6 @@ _PAGE_LOAD_FAILURE_MARKERS = (
 
 def _validate_email(email: str) -> bool:
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
-
-
-def _credential_management_label(mode: str) -> str:
-    return "AG凭证管理" if mode == "antigravity" else "GCLI凭证管理"
 
 
 def _origin_base_url() -> str:
@@ -97,7 +93,6 @@ def _create_login_task(email: str, mode: str) -> str:
             "saved_credential_filename": "",
             "saved_proxy_name": "",
             "saved_user_email": "",
-            "saved_preview_enabled": False,
             "seq": 0,
             "logs": [],
             "created_at": now,
@@ -208,7 +203,6 @@ def _set_login_task_saved_credential(task_id: str, saved_result: dict) -> None:
         task["saved_credential_filename"] = saved_result.get("filename") or ""
         task["saved_proxy_name"] = saved_result.get("proxy_name") or ""
         task["saved_user_email"] = saved_result.get("user_email") or ""
-        task["saved_preview_enabled"] = bool(saved_result.get("preview_enabled"))
         task["updated_at"] = time.time()
 
 
@@ -276,7 +270,6 @@ async def _import_batch_generated_credential_to_origin(
     result: dict,
     email: str,
     progress_logger,
-    mode: str,
 ) -> dict:
     import httpx
 
@@ -285,8 +278,8 @@ async def _import_batch_generated_credential_to_origin(
     if not base_url or not panel_token:
         raise RuntimeError("未配置远程服务地址或连接密码，无法回传凭证")
 
-    mode = validate_mode(mode)
-    management_label = _credential_management_label(mode)
+    mode = _BATCH_GENERATE_MODE
+    management_label = _BATCH_GENERATE_MANAGEMENT_LABEL
     credential_data = dict((result or {}).get("credentials") or {})
     project_id = str((result or {}).get("project_id") or credential_data.get("project_id") or "").strip()
     subscription_tier = str((result or {}).get("subscription_tier") or "").strip() or None
@@ -330,8 +323,6 @@ async def _import_batch_generated_credential_to_origin(
     progress_logger(f"原项目 {management_label} 已保存凭证: {saved_filename}")
     if response_data.get("proxy_name"):
         progress_logger(f"原项目已创建并绑定代理: {response_data['proxy_name']}")
-    if response_data.get("preview_enabled"):
-        progress_logger(f"原项目已开启 Preview: {saved_filename}")
     progress_logger(f"原项目 {management_label} 已显示邮箱: {response_data.get('user_email') or email}")
 
     return {
@@ -339,7 +330,6 @@ async def _import_batch_generated_credential_to_origin(
         "proxy_name": response_data.get("proxy_name") or "",
         "proxy_url": response_data.get("proxy_url") or "",
         "user_email": response_data.get("user_email") or email,
-        "preview_enabled": bool(response_data.get("preview_enabled")),
     }
 
 
@@ -347,18 +337,16 @@ async def _persist_batch_generated_credential(
     result: dict,
     email: str,
     progress_logger,
-    mode: str,
 ) -> dict:
     if _use_origin_import_api():
         return await _import_batch_generated_credential_to_origin(
             result,
             email,
             progress_logger,
-            mode,
         )
 
-    mode = validate_mode(mode)
-    management_label = _credential_management_label(mode)
+    mode = _BATCH_GENERATE_MODE
+    management_label = _BATCH_GENERATE_MANAGEMENT_LABEL
     credential_data = dict((result or {}).get("credentials") or {})
     project_id = str((result or {}).get("project_id") or credential_data.get("project_id") or "").strip()
     subscription_tier = str((result or {}).get("subscription_tier") or "").strip() or None
@@ -403,17 +391,6 @@ async def _persist_batch_generated_credential(
         raise RuntimeError(f"绑定专属代理失败: {saved_filename}")
     progress_logger(f"已将代理 {proxy_info['proxy_name']} 绑定到凭证 {saved_filename}")
 
-    preview_enabled = False
-    if mode == "geminicli":
-        preview_result = await configure_preview_channel_common(saved_filename, mode="geminicli")
-        if not preview_result.get("success"):
-            error_message = str(preview_result.get("error") or preview_result.get("message") or "开启 Preview 失败")
-            raise RuntimeError(f"开启 Preview 失败: {error_message}")
-        preview_enabled = True
-        progress_logger(f"Preview 已开启: {saved_filename}")
-    else:
-        progress_logger(f"{management_label} 不需要开启 Preview，已跳过")
-
     updated = await storage_adapter.update_credential_state(
         saved_filename,
         {"user_email": email},
@@ -428,7 +405,6 @@ async def _persist_batch_generated_credential(
         "proxy_name": proxy_info["proxy_name"],
         "proxy_url": proxy_info["proxy_url"],
         "user_email": email,
-        "preview_enabled": preview_enabled,
     }
 
 
@@ -440,10 +416,9 @@ async def _run_login_task(
     phone: str,
     phone_code_url: str,
     proxy_url: str,
-    mode: str,
 ) -> None:
-    mode = validate_mode(mode)
-    management_label = _credential_management_label(mode)
+    mode = _BATCH_GENERATE_MODE
+    management_label = _BATCH_GENERATE_MANAGEMENT_LABEL
 
     def progress_logger(message: str, level: str = "info") -> None:
         _append_login_task_log(task_id, message, level)
@@ -475,10 +450,14 @@ async def _run_login_task(
                 unusable_message = "验证方式选择页未提供 Verify your phone number，该账号不可用"
             elif validation_status == "phone_rate_limited":
                 unusable_message = "当前手机号异常：This phone number has already been used too many times for verification"
+            elif validation_status == "phone_number_unusable":
+                unusable_message = "当前手机号异常：This phone number can't be used for verification"
             elif validation_status == "service_unavailable":
                 unusable_message = "页面提示 Entire service unavailable，该账号不可用"
             elif validation_status == "recover_account_required":
                 unusable_message = "页面提示 Recover account，该账号不可用"
+            elif validation_status == "email_phone_already_bound":
+                unusable_message = "登录提交后复查页出现 Send 按钮，该邮箱已绑定手机"
             _append_login_task_log(task_id, f"{unusable_message}，准备处理下一行账号", "error")
             with _LOGIN_TASK_LOCK:
                 task = _LOGIN_TASKS.get(task_id)
@@ -511,7 +490,7 @@ async def _run_login_task(
         _set_login_task_test_result(task_id, test_info)
         if test_status_code == 200:
             try:
-                saved_result = await _persist_batch_generated_credential(result, email, progress_logger, mode=mode)
+                saved_result = await _persist_batch_generated_credential(result, email, progress_logger)
             except Exception as exc:
                 error = str(exc).strip() or f"保存凭证到 {management_label} 失败"
                 _set_login_task_failure(task_id, "credential_persist_failed", error)
@@ -522,8 +501,6 @@ async def _run_login_task(
                 f"filename={saved_result['filename']}",
                 f"proxy={saved_result['proxy_name']}",
             ]
-            if saved_result.get("preview_enabled"):
-                update_parts.append("preview=ON")
             update_parts.append(f"email={saved_result['user_email']}")
             _append_login_task_log(
                 task_id,
@@ -558,7 +535,10 @@ async def login_first_account(
     password = request.password
     line_number = max(1, int(request.line_number or 1))
     line_label = f"第{line_number}行"
-    mode = validate_mode(request.mode or "geminicli")
+    requested_mode = str(request.mode or _BATCH_GENERATE_MODE).strip()
+    if requested_mode != _BATCH_GENERATE_MODE:
+        raise HTTPException(status_code=400, detail="批量生成凭证文件仅支持 Antigravity 凭证")
+    mode = _BATCH_GENERATE_MODE
 
     if not _validate_email(email):
         raise HTTPException(status_code=400, detail=f"{line_label}邮箱格式不正确")
@@ -591,7 +571,6 @@ async def login_first_account(
         phone=request.phone or "",
         phone_code_url=request.phone_code_url or "",
         proxy_url=request.proxy_url or "",
-        mode=mode,
     )
     log.info(f"[BATCH_GENERATE] 已提交{line_label}账号登录任务: email={email}, mode={mode}, task_id={task_id}")
     return JSONResponse(
@@ -619,7 +598,7 @@ async def get_login_task_logs(
             "task_id": task_id,
             "status": task["status"],
             "email": task["email"],
-            "mode": task.get("mode") or "geminicli",
+            "mode": task.get("mode") or _BATCH_GENERATE_MODE,
             "account_unusable": bool(task.get("account_unusable")),
             "failure_reason": task.get("failure_reason") or "",
             "error": task.get("failure_error") or "",
@@ -629,7 +608,6 @@ async def get_login_task_logs(
             "saved_credential_filename": task.get("saved_credential_filename") or "",
             "saved_proxy_name": task.get("saved_proxy_name") or "",
             "saved_user_email": task.get("saved_user_email") or "",
-            "saved_preview_enabled": bool(task.get("saved_preview_enabled")),
             "logs": logs,
             "last_seq": task["seq"],
         }
