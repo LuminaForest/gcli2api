@@ -9,6 +9,7 @@ from log import log
 from src.auth import (
     asyncio_complete_auth_flow,
     build_temporary_credentials_from_callback_url,
+    complete_antigravity_auth_flow_from_callback_url_stateless,
     complete_auth_flow_from_callback_url,
     create_auth_url,
     get_auth_status,
@@ -141,6 +142,11 @@ async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depend
             result = await build_temporary_credentials_from_callback_url(
                 request.callback_url,
                 mode=request.mode,
+                proxy_url=request.proxy_url,
+            )
+        elif str(request.mode or "").strip().lower() == "antigravity":
+            result = await complete_antigravity_auth_flow_from_callback_url_stateless(
+                request.callback_url,
                 proxy_url=request.proxy_url,
             )
         else:

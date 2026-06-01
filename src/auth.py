@@ -544,6 +544,85 @@ async def build_temporary_credentials_from_callback_url(
         return {"success": False, "error": str(e)}
 
 
+async def _save_antigravity_credentials_from_exchange_result(
+    exchange_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    state = exchange_result["state"]
+    credentials = exchange_result["credentials_obj"]
+    proxy_kwargs = exchange_result.get("proxy_kwargs") or None
+    subscription_tier = None
+
+    project_id = None
+    try:
+        log.info("Antigravity模式（无状态回调URL）：从API获取project_id...")
+        antigravity_url = await get_antigravity_api_url()
+        project_id, subscription_tier = await fetch_project_id_and_tier(
+            credentials.access_token,
+            ANTIGRAVITY_USER_AGENT,
+            antigravity_url,
+            proxy_kwargs=proxy_kwargs,
+        )
+    except Exception as e:
+        log.warning(f"Antigravity无状态回调认证自动检测 project_id 失败，将使用默认项目ID: {e}")
+
+    if project_id:
+        log.info(f"成功从API获取project_id: {project_id}, tier: {subscription_tier}")
+    else:
+        project_id = DEFAULT_PROJECT_ID
+        log.warning(f"无法从API获取project_id，使用默认project_id: {project_id}")
+
+    saved_filename = await save_credentials(
+        credentials,
+        project_id,
+        mode="antigravity",
+        subscription_tier=subscription_tier,
+    )
+    creds_data = _prepare_credentials_data(
+        credentials,
+        project_id,
+        mode="antigravity",
+        subscription_tier=subscription_tier,
+    )
+
+    _cleanup_auth_flow_server(state)
+
+    log.info("从回调URL完成Antigravity OAuth认证成功，凭证已保存")
+    return {
+        "success": True,
+        "credentials": creds_data,
+        "file_path": saved_filename,
+        "auto_detected_project": False,
+        "mode": "antigravity",
+    }
+
+
+async def complete_antigravity_auth_flow_from_callback_url_stateless(
+    callback_url: str,
+    proxy_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """从回调URL无状态保存Antigravity凭证，兼容多worker部署。"""
+    try:
+        log.info(f"开始从回调URL无状态完成Antigravity认证: {callback_url}")
+        exchange_result = await _exchange_callback_code_for_credentials(
+            callback_url,
+            mode="antigravity",
+            proxy_url=proxy_url,
+            allow_stateless=True,
+        )
+        if not exchange_result.get("success"):
+            return exchange_result
+
+        try:
+            return await _save_antigravity_credentials_from_exchange_result(exchange_result)
+        except Exception as e:
+            log.error(f"从回调URL无状态获取Antigravity凭证失败: {e}")
+            return {"success": False, "error": f"获取凭证失败: {str(e)}"}
+
+    except Exception as e:
+        log.error(f"从回调URL无状态完成Antigravity认证失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
 def wait_for_callback_sync(state: str, timeout: int = 300) -> Optional[str]:
     """同步等待OAuth回调完成，使用对应流程的专用服务器"""
     if state not in auth_flows:
