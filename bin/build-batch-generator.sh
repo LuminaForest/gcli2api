@@ -35,7 +35,7 @@ docker buildx build \
     --platform "${PLATFORMS}" \
     -f "${DOCKERFILE_PATH}" \
     -t "${IMAGE_NAME}:${VERSION}" \
-    -t "${IMAGE_NAME}:latet" \
+    -t "${IMAGE_NAME}:latest" \
     --push \
     "${ROOT_DIR}"
 
